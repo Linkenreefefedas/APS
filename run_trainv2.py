@@ -41,8 +41,6 @@ from tqdm import tqdm
 from torch.utils.data._utils.collate import default_collate
 
 
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ------------------------------ I/O utils ------------------------------
@@ -94,34 +92,70 @@ def scan_images(dirs, exts, recursive=True):
 def _get_base_model(m):
     return m.module if hasattr(m, 'module') else m
 
-def save_checkpoint(path, model, opt, sch, epoch, global_step, best_iou, args):
+def save_checkpoint(path, model, opt, sch, epoch, best_iou, lc):
     state = {
         'model': _get_base_model(model).state_dict(),
         'optimizer': opt.state_dict(),
         'scheduler': sch.state_dict(),
         'epoch': int(epoch),
         'best_iou': float(best_iou),
+        'lc': float(lc)
     }
     torch.save(state, path)
 
-# def collate_keep_rgb_mask_as_list(batch):
-#     # 先把會用於訓練的鍵保留，由 default_collate 做堆疊（它會檢查 shape）
-#     keys_stack = [
-#         'sam_t','dn_t',
-#         'proto_fg_sam','proto_bg_sam','proto_fg_dn','proto_bg_dn',
-#         'x_in',
-#         'H_fg_star','H_bg_star',
-#         'K_fg_star','K_bg_star'
-#     ]
-#     batch_core = [{k:v for k,v in b.items() if k in keys_stack} for b in batch]
-#     out = default_collate(batch_core)  # 這裡會把同形狀的 tensor 堆成 batch
+def collate_keep_rgb_mask_as_list(batch):
+    # 先把會用於訓練的鍵保留，由 default_collate 做堆疊（它會檢查 shape）
+    keys_stack = [
+        'sam_t','dn_t',
+        'proto_fg_sam','proto_bg_sam','proto_fg_dn','proto_bg_dn',
+        'x_in',
+        'H_fg_star','H_bg_star',
+        'K_fg_star','K_bg_star'
+    ]
+    batch_core = [{k:v for k,v in b.items() if k in keys_stack} for b in batch]
+    out = default_collate(batch_core)  # 這裡會把同形狀的 tensor 堆成 batch
 
-#     # 其餘變動尺寸的欄位保留成 list（不讓 default_collate 過手）
-#     if 'tgt_rgb' in batch[0]:
-#         out['tgt_rgb']  = [b['tgt_rgb']  for b in batch]
-#     if 'tgt_mask' in batch[0]:
-#         out['tgt_mask'] = [b['tgt_mask'] for b in batch]
-#     return out
+    # 其餘變動尺寸的欄位保留成 list（不讓 default_collate 過手）
+    if 'tgt_rgb' in batch[0]:
+        out['tgt_rgb']  = [b['tgt_rgb']  for b in batch]
+    if 'tgt_mask' in batch[0]:
+        out['tgt_mask'] = [b['tgt_mask'] for b in batch]
+    return out
+
+def _to_bchw(t, name="tensor"):
+    """
+    將 t 規整為 [B,C,H,W]。
+    規則：
+        - 3D: [C,H,W] -> [1,C,H,W]
+        - 4D: [B,C,H,W] -> 原樣
+        - 5D: 常見為 [B,Cg,K,H,W] 或 [1,B,C,H,W] 等
+            若形狀像 [B, Cg, K, H, W]：把 Cg 和 K 併到通道：C = Cg*K
+            若形狀像 [1, B, C, H, W]：先 squeeze 前導的 1 再判斷
+        - 其他維度數：報錯
+    """
+    if t is None:
+        raise ValueError(f"{name} is None")
+
+    # 先消掉所有「前導的 size=1」維度（但保留末兩維 H,W）
+    while t.dim() >= 5 and t.shape[0] == 1:
+        t = t.squeeze(0)
+
+    if t.dim() == 3:
+        # [C,H,W]
+        t = t.unsqueeze(0)
+    elif t.dim() == 4:
+        # [B,C,H,W]
+        pass
+    elif t.dim() == 5:
+        # 嘗試辨識 [B,Cg,K,H,W] -> 併 Cg,K
+        B, D1, D2, H, W = t.shape
+        # 若其中一維是小批次誤疊（像 [1,B,C,H,W]）已在上面 squeeze 過
+        # 合併第1與第2維到通道
+        t = t.reshape(B, D1 * D2, H, W)
+    else:
+        raise ValueError(f"{name}: unexpected ndim={t.dim()}, shape={tuple(t.shape)}")
+
+    return t
 
 # ---- New: deterministic resize+letterbox to unify cache grid size ----
 def resize_letterbox_rgb(rgb: np.ndarray,
@@ -182,14 +216,14 @@ def get_grid_feats_dinov3_hf(image_rgb: np.ndarray, model_id: str) -> torch.Tens
     assert x.dim() in (3,4)
     if x.dim()==4:
         grid = x[0].permute(1,2,0).contiguous()
-        return F.normalize(grid, dim=-1).to(torch.float32)
+        return F.normalize(grid, dim=-1, eps=1e-6).to(torch.float32)
     Hp, Wp = inputs["pixel_values"].shape[-2:]
     psize = int(getattr(getattr(model, "config", None), "patch_size", 16))
     Gh, Gw = Hp//psize, Wp//psize
     M = Gh*Gw
     toks = x[0, -M:, :]
     grid = toks.view(Gh, Gw, -1).contiguous()
-    return F.normalize(grid, dim=-1).to(torch.float32)
+    return F.normalize(grid, dim=-1, eps=1e-6).to(torch.float32)
 
 # ------------------------------ SAM2 image encoder ---------------------
 def sam2_build_image_predictor(cfg_yaml: str, ckpt_path: str):
@@ -221,7 +255,7 @@ def get_sam2_feat(image_rgb: np.ndarray, predictor, use_autocast: bool=False) ->
     with AutocastCtx(use_autocast):
         predictor.set_image(image_rgb)
     feat = _extract_sam2_image_embed(predictor)  # [C,Hf,Wf]
-    return F.normalize(feat, dim=0).to(torch.float32)
+    return F.normalize(feat, dim=0, eps=1e-6).to(torch.float32)
 
 # ------------------------------ Prototypes & sims ----------------------
 def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
@@ -238,14 +272,14 @@ def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
     m_small = torch.from_numpy(m_small).to(device=tgt_sam.device, dtype=torch.float32)
     fg = (m_small>0.5).float(); bg = (m_small<=0.5).float()
     proto_fg_sam = (ref_sam * fg.unsqueeze(0)).sum((1,2)) / (fg.sum()+1e-8)
-    proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
+    proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
     sim_fg_sam = (tgt_sam * proto_fg_sam.view(-1,1,1)).sum(0)
     if use_bg_proto:
         if bg.sum()<1:
             inv = (1.0-m_small).flatten(); topk = torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hf,Wf)
         proto_bg_sam = (ref_sam * bg.unsqueeze(0)).sum((1,2)) / (bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
         sim_sam = torch.sigmoid((sim_fg_sam - (tgt_sam * proto_bg_sam.view(-1,1,1)).sum(0))/tau)
     else:
         sim_sam = (sim_fg_sam+1.0)/2.0
@@ -258,11 +292,11 @@ def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
     m_small2 = torch.from_numpy(m_small2).to(device=tgt_grid.device, dtype=torch.float32)
     fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
     proto_fg_dn = (ref_grid * fg2.unsqueeze(-1)).sum((0,1)) / (fg2.sum()+1e-8)
-    proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
+    proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
     sim_fg_dn = (tgt_grid * proto_fg_dn.view(1,1,-1)).sum(-1)
     if use_bg_proto:
         proto_bg_dn = (ref_grid * bg2.unsqueeze(-1)).sum((0,1)) / (bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
         sim_dn = torch.sigmoid((sim_fg_dn - (tgt_grid * proto_bg_dn.view(1,1,-1)).sum(-1))/tau)
     else:
         sim_dn = (sim_fg_dn+1.0)/2.0
@@ -338,7 +372,7 @@ class ProtoCrossAttn(nn.Module):
         return x, out
 
 class PointPromptNetB(nn.Module):
-    def __init__(self, c_in=101, c0=192, c1=256, c2=384, kmax=8,
+    def __init__(self, c_in=101, c0=192, c1=256, c2=384, kmax_f=8, kmax_b = 8 , 
                  sam_c=256, dino_c=768, proj_dim=48):
         super().__init__()
         self.proj_sam = nn.Conv2d(sam_c, proj_dim, 1, bias=False)
@@ -356,9 +390,10 @@ class PointPromptNetB(nn.Module):
                                   nn.Conv2d(c1, c0, 1, bias=False), nn.BatchNorm2d(c0), nn.GELU(), Block(c0))
         self.fg_head = nn.Conv2d(c0, 1, 1)
         self.bg_head = nn.Conv2d(c0, 1, 1)
-        self.cnt_fg  = nn.Conv2d(c0, kmax+1, 1)
-        self.cnt_bg  = nn.Conv2d(c0, kmax+1, 1)
-        self.kmax = kmax
+        self.cnt_fg  = nn.Conv2d(c0, kmax_f+1, 1)
+        self.cnt_bg  = nn.Conv2d(c0, kmax_b+1, 1)
+        self.kmax_f = kmax_f
+        self.kmax_b = kmax_b
         # initialize lightly
         for m in [self.proj_sam, self.proj_dn]:
             nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
@@ -379,11 +414,52 @@ class PointPromptNetB(nn.Module):
 
     def forward(self, x_in, sam_feat_tgt, dino_feat_tgt,
                 proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn):
-        # project encoder features to small dims & concat input
-        sam_p = self.proj_sam(sam_feat_tgt)
-        dn_p  = self.proj_dn(dino_feat_tgt.permute(2,0,1).unsqueeze(0))  # [1,Cd,Gh,Gw] -> [1,pd,Gh,Gw]
-        if sam_p.shape[-2:] != dn_p.shape[-2:]:
-            dn_p = F.interpolate(dn_p, size=sam_p.shape[-2:], mode='bilinear', align_corners=False)
+    
+        # --- 規整成 [B,C,H,W] ---
+        x_in  = _to_bchw(x_in,  "x_in")
+    
+        # SAM/DINO 輸入規整（你先前已處理 3D/4D，沿用即可）
+        # sam_in: [B,Cs,Hf,Wf]
+        if sam_feat_tgt.dim() == 3:
+            sam_in = sam_feat_tgt.unsqueeze(0)
+        elif sam_feat_tgt.dim() == 4:
+            sam_in = sam_feat_tgt
+        else:
+            raise ValueError(f"sam_feat_tgt ndim={sam_feat_tgt.dim()}")
+    
+        # dino: 支援 [Gh,Gw,C], [C,Gh,Gw], [B,C,Gh,Gw], [B,Gh,Gw,C]
+        if dino_feat_tgt.dim() == 3:
+            if dino_feat_tgt.shape[-1] in (256, 384, 768):   # [Gh,Gw,C]
+                dn_in = dino_feat_tgt.permute(2,0,1).unsqueeze(0)
+            elif dino_feat_tgt.shape[0] in (256, 384, 768):  # [C,Gh,Gw]
+                dn_in = dino_feat_tgt.unsqueeze(0)
+            else:
+                raise ValueError(f"dino_feat_tgt shape not recognized: {tuple(dino_feat_tgt.shape)}")
+        elif dino_feat_tgt.dim() == 4:
+            if dino_feat_tgt.shape[1] in (256, 384, 768):    # [B,C,Gh,Gw]
+                dn_in = dino_feat_tgt
+            elif dino_feat_tgt.shape[-1] in (256, 384, 768): # [B,Gh,Gw,C]
+                dn_in = dino_feat_tgt.permute(0,3,1,2)
+            else:
+                raise ValueError(f"dino_feat_tgt shape not recognized: {tuple(dino_feat_tgt.shape)}")
+        else:
+            raise ValueError(f"dino_feat_tgt ndim={dino_feat_tgt.dim()}")
+    
+        # --- 投影 ---
+        sam_p = self.proj_sam(sam_in)  # [B, ps, Hf, Wf]
+        dn_p  = self.proj_dn(dn_in)    # [B, pd, Gh, Gw]
+    
+        # --- 空間對齊到 x_in 的 H×W ---
+        H, W = x_in.shape[-2], x_in.shape[-1]
+        if sam_p.shape[-2:] != (H, W):
+            sam_p = F.interpolate(sam_p, size=(H, W), mode='bilinear', align_corners=False)
+        if dn_p.shape[-2:] != (H, W):
+            dn_p  = F.interpolate(dn_p,  size=(H, W), mode='bilinear', align_corners=False)
+    
+        # --- 若 x_in 偶然是 5D（例如 [B,2,K,H,W]）再保險一次壓成 BCHW ---
+        x_in = _to_bchw(x_in, "x_in(BCHW-check)")
+    
+        # --- 這裡就能安全 cat ---
         x = torch.cat([sam_p, dn_p, x_in], dim=1)
         x = self.in_proj(x)
         s0 = self.enc0(x)
@@ -396,8 +472,11 @@ class PointPromptNetB(nn.Module):
         fg_tok, bg_tok = self.map_proto(proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
         protos = torch.stack([fg_tok, bg_tok], dim=1)  # [B,2,c0]
         u0, _ = self.pxattn(u0, protos)
-        H_fg = torch.sigmoid(self.fg_head(u0))
-        H_bg = torch.sigmoid(self.bg_head(u0))
+        # H_fg = torch.sigmoid(self.fg_head(u0))
+        # H_bg = torch.sigmoid(self.bg_head(u0))
+        H_fg = self.fg_head(u0)
+        H_bg = self.bg_head(u0)
+
         Pk_fg = self.cnt_fg(u0).mean(dim=(2,3))
         Pk_bg = self.cnt_bg(u0).mean(dim=(2,3))
         return H_fg, H_bg, Pk_fg, Pk_bg
@@ -427,7 +506,7 @@ def count_targets(mask: np.ndarray) -> int:
 
 def build_gt(target_mask: np.ndarray,
              sim_fg_outside: torch.Tensor,
-             size_hw: Tuple[int,int], kmax:int=8,
+             size_hw: Tuple[int,int], kmax_f:int=8, kmax_b:int =8,
              alpha:float=0.5, beta:float=0.5):
     # 以 sim_fg_outside 的 device 為準（cuda 或 cpu）
     device = sim_fg_outside.device
@@ -446,11 +525,11 @@ def build_gt(target_mask: np.ndarray,
     # counts（純 CPU/Numpy 計算，回傳 python int 不涉 device）
     m_small = (cv2.resize(target_mask, (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 127).astype(np.uint8)
     n, _ = cv2.connectedComponents(m_small, connectivity=8)
-    K_fg_star = min(max(1, n-1), kmax)
+    K_fg_star = min(max(1, n-1), kmax_f)
 
     cnts = cv2.findContours(m_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
     perim = sum(cv2.arcLength(c, True) for c in cnts) if cnts else 0.0
-    K_bg_star = int(np.clip(round(perim/200.0), 0, kmax))
+    K_bg_star = int(np.clip(round(perim/200.0), 0, kmax_b))
 
     return H_fg_star, H_bg_star, K_fg_star, K_bg_star
 
@@ -531,8 +610,8 @@ class EpisodeDataset(Dataset):
     def _load_cached(self, path: str):
         key = self._key(path)
         data = np.load(os.path.join(self.cache_dir, f"{key}.npz"))
-        sam = torch.from_numpy(data['sam'].astype(np.float32)).to(device)
-        dng = torch.from_numpy(data['dng'].astype(np.float32)).to(device)
+        sam = torch.from_numpy(data['sam'].astype(np.float32))
+        dng = torch.from_numpy(data['dng'].astype(np.float32))
         return sam, dng  # [Cs,Hf,Wf], [Cd,Gh,Gw]
 
     def __len__(self): return len(self.episodes)
@@ -550,13 +629,13 @@ class EpisodeDataset(Dataset):
         m_small = torch.from_numpy(m_small)
         fg = (m_small>0.5).float(); bg = (m_small<=0.5).float()
         proto_fg_sam = (sam_r * fg.unsqueeze(0)).sum((1,2))/(fg.sum()+1e-8)
-        proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
+        proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
         sim_fg_sam = (sam_t * proto_fg_sam.view(-1,1,1)).sum(0)
         if bg.sum()<1:
             inv = (1.0-m_small).flatten(); topk=torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hf,Wf)
         proto_bg_sam = (sam_r * bg.unsqueeze(0)).sum((1,2))/(bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
         sim_bg_sam = (sam_t * proto_bg_sam.view(-1,1,1)).sum(0)
         sim_sam = torch.sigmoid((sim_fg_sam - sim_bg_sam)/0.2).to(torch.float32)
         # dino
@@ -565,10 +644,10 @@ class EpisodeDataset(Dataset):
         m_small2 = torch.from_numpy(m_small2)
         fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
         proto_fg_dn = (dn_r * fg2.unsqueeze(0)).sum((1,2))/(fg2.sum()+1e-8)
-        proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
+        proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
         sim_fg_dn = (dn_t * proto_fg_dn.view(-1,1,1)).sum(0)
         proto_bg_dn = (dn_r * bg2.unsqueeze(0)).sum((1,2))/(bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
         sim_bg_dn = (dn_t * proto_bg_dn.view(-1,1,1)).sum(0)
         sim_dn = torch.sigmoid((sim_fg_dn - sim_bg_dn)/0.2).to(torch.float32)
         # upsample sims to Hf,Wf
@@ -642,14 +721,14 @@ class COCO20iEpisodeAdapter(Dataset):
         bg = (m_small <= 0.5).float()
     
         proto_fg_sam = (sam_r * fg.unsqueeze(0)).sum((1,2)) / (fg.sum()+1e-8)
-        proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
+        proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
         sim_fg_sam = (sam_t * proto_fg_sam.view(-1,1,1)).sum(0)
     
         if bg.sum() < 1:
             inv = (1.0-m_small).flatten(); topk = torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hr,Wr)
         proto_bg_sam = (sam_r * bg.unsqueeze(0)).sum((1,2)) / (bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
         sim_bg_sam = (sam_t * proto_bg_sam.view(-1,1,1)).sum(0)
     
         sim_sam = torch.sigmoid((sim_fg_sam - sim_bg_sam)/0.2).to(torch.float32)
@@ -661,11 +740,11 @@ class COCO20iEpisodeAdapter(Dataset):
         fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
     
         proto_fg_dn = (dn_r * fg2.unsqueeze(0)).sum((1,2))/(fg2.sum()+1e-8)
-        proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
+        proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
         sim_fg_dn = (dn_t * proto_fg_dn.view(-1,1,1)).sum(0)
     
         proto_bg_dn = (dn_r * bg2.unsqueeze(0)).sum((1,2))/(bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
         sim_bg_dn = (dn_t * proto_bg_dn.view(-1,1,1)).sum(0)
     
         sim_dn = torch.sigmoid((sim_fg_dn - sim_bg_dn)/0.2).to(torch.float32)
@@ -704,23 +783,76 @@ class COCO20iEpisodeAdapter(Dataset):
     
 
 # ------------------------------ Losses --------------------------------
-class FocalBCE(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super().__init__(); self.a=alpha; self.g=gamma; self.red=reduction
-    def forward(self, pred, target):
-        pred = torch.clamp(pred, 1e-6, 1-1e-6)
-        pt = pred*target + (1-pred)*(1-target)
-        w = self.a*target + (1-self.a)*(1-target)
-        loss = -w*((1-pt)**self.g)*torch.log(pt)
-        if self.red=='mean': return loss.mean()
-        if self.red=='sum': return loss.sum()
+# class FocalBCE(nn.Module):
+#     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+#         super().__init__(); self.a=alpha; self.g=gamma; self.red=reduction
+#     def forward(self, pred, target):
+#         pred = torch.clamp(pred, 1e-6, 1-1e-6)
+#         pt = pred*target + (1-pred)*(1-target)
+#         w = self.a*target + (1-self.a)*(1-target)
+#         loss = -w*((1-pt)**self.g)*torch.log(pt)
+#         if self.red=='mean': return loss.mean()
+#         if self.red=='sum': return loss.sum()
+#         return loss
+
+class FocalBCEWithLogits(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-6):
+        super().__init__()
+        self.a = alpha
+        self.g = gamma
+        self.red = reduction
+        self.eps = eps
+
+    def forward(self, logits, target, mask=None):
+        # 1) 基礎 BCE（logits 版），避免自己手刻 log/exp 的數值風險
+        ce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        # 2) p_t 與 alpha_t
+        p = torch.sigmoid(logits)
+        p_t = p * target + (1 - p) * (1 - target)
+        alpha_t = self.a * target + (1 - self.a) * (1 - target)
+        # 3) 調制因子 (1 - p_t)^gamma
+        mod = (1 - p_t).clamp_min(self.eps) ** self.g
+        loss = alpha_t * mod * ce  # 對每一像素/元素
+
+        if mask is not None:
+            loss = loss * mask
+            denom = mask.sum().clamp_min(1.0)
+            return loss.sum() / denom
+
+        if self.red == 'mean':
+            return loss.mean()
+        if self.red == 'sum':
+            return loss.sum()
         return loss
+
+def prep_target_like(logits, target):
+    """
+    將 target 調整為與 logits 相容的形狀與解析度：
+    - 接受 [B,H,W]、[B,1,H,W]、[B,1,1,H,W]
+    - 回傳 [B,1,Hlog,Wlog]
+    """
+    # 去掉多餘的 1 維
+    if target.dim() == 5 and target.size(2) == 1:
+        target = target.squeeze(2)   # [B,1,H,W]
+    if target.dim() == 3:
+        target = target.unsqueeze(1) # [B,1,H,W]
+    assert target.dim() == 4, f"target ndim should be 4, got {target.dim()} with shape {tuple(target.shape)}"
+
+    # 解析度對齊
+    Ht, Wt = target.shape[-2:]
+    Hl, Wl = logits.shape[-2:]
+    if (Ht, Wt) != (Hl, Wl):
+        target = F.interpolate(target.float(), size=(Hl, Wl), mode='bilinear', align_corners=False)
+        # 二值/機率標籤：插值後夾一下範圍
+        target = target.clamp_(0.0, 1.0)
+    return target
 
 # ------------------------------ Train / Eval --------------------------
 def train_loop(args):
     start_epoch = 0
     global_step = 0
     best_iou = 0.0
+    lc = args.lc
 
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
@@ -729,6 +861,7 @@ def train_loop(args):
         if 'scheduler' in ckpt: sch.load_state_dict(ckpt['scheduler'])
         best_iou = float(ckpt.get('best_iou', 0.0))
         start_epoch = int(ckpt.get('epoch', -1)) + 1
+        lc = float(ckpt.get('lc', args.lc))
     
         print(f"[resume] from {args.resume} → epoch {start_epoch}, step {global_step}, best_iou {best_iou:.4f}")
 
@@ -740,28 +873,34 @@ def train_loop(args):
     # === 用 COCO-20i Random episodes 當訓練資料 ===
     base_train = dl.OneShotCOCO20iRandom(index=idx_train, episodes=args.episodes, seed=2025)
     ds = COCO20iEpisodeAdapter(base_train, args.cache_dir, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
-    dl_torch = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                                num_workers=args.workers, pin_memory=True,
-                                persistent_workers=True, drop_last=True)
+    dl_torch = DataLoader(
+        ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True,
+        persistent_workers=True, drop_last=True,
+        collate_fn=collate_keep_rgb_mask_as_list,
+    )
     
     # eval data
     idx_val = dl.build_coco20i_index(args.manifest_val, fold=args.coco20i_fold, role=args.role)
     base_val = dl.OneShotCOCO20iRandom(index=idx_val, episodes=args.val_samples, seed=2025)
     ds_val = COCO20iEpisodeAdapter(base_val, args.cache_dir, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
-    eval_loader = DataLoader(ds_val, batch_size=1, shuffle=False)
+    eval_loader = DataLoader(
+        ds_val, batch_size=1, shuffle=False,
+        collate_fn=collate_keep_rgb_mask_as_list,
+    )
 
     # === 估計通道數，建立模型 ===
     # 從第一筆資料探測 Cs/Cd
     probe = ds[0]
     sam_C = probe['sam_t'].shape[1]
     dino_C = probe['dn_t'].shape[0]
-    model = PointPromptNetB(c_in=101, kmax=args.kmax, sam_c=sam_C, dino_c=dino_C).to(device)
+    model = PointPromptNetB(c_in=101, kmax_f=args.kmax_f,kmax_b= args.kmax_b, sam_c=sam_C, dino_c=dino_C).to(device)
     if args.torch_compile:
         model = torch.compile(model, mode='reduce-overhead')
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs*max(1,len(dl_torch)))
-    bce = FocalBCE(alpha=0.25, gamma=2.0)
+    bce = FocalBCEWithLogits(alpha=0.25, gamma=2.0)
     ce  = nn.CrossEntropyLoss()
 
     global_step = 0
@@ -769,15 +908,21 @@ def train_loop(args):
         if (epoch+1) % 10 == 0:
             base_train = dl.OneShotCOCO20iRandom(index=idx_train, episodes=args.episodes, seed=epoch)
             ds = COCO20iEpisodeAdapter(base_train, args.cache_dir, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
-            dl_torch = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                                            num_workers=args.workers, pin_memory=True,
-                                            persistent_workers=True, drop_last=True)
+            dl_torch = DataLoader(
+                    ds, batch_size=args.batch_size, shuffle=True,
+                    num_workers=args.workers, pin_memory=True,
+                    persistent_workers=True, drop_last=True,
+                    collate_fn=collate_keep_rgb_mask_as_list,
+                )
             
             # eval data
             idx_val = dl.build_coco20i_index(args.manifest_val, fold=args.coco20i_fold, role=args.role)
             base_val = dl.OneShotCOCO20iRandom(index=idx_val, episodes=args.val_samples, seed=epoch)
             ds_val = COCO20iEpisodeAdapter(base_val, args.cache_dir, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
-            eval_loader = DataLoader(ds_val, batch_size=1, shuffle=False)
+            eval_loader = DataLoader(
+                    ds_val, batch_size=1, shuffle=False,
+                    collate_fn=collate_keep_rgb_mask_as_list,
+                )
 
         model.train(); t0=time.time()
         for it, batch in enumerate(tqdm(dl_torch, desc=f"Epoch {epoch}", unit="batch")):
@@ -795,10 +940,40 @@ def train_loop(args):
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type=="cuda")):
                 H_fg, H_bg, Pk_fg, Pk_bg = model(x_in, sam_t, dn_t, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
-                L_heat = bce(H_fg, Hfg_s.unsqueeze(1)) + bce(H_bg, Hbg_s.unsqueeze(1))
-                L_cnt  = ce(Pk_fg, Kfg_s) + ce(Pk_bg, Kbg_s)
-                loss = L_heat + args.lc*L_cnt
-            opt.zero_grad(set_to_none=True); loss.backward()
+            
+            # ↓↓↓ logits/targets 轉成 float32 再算 loss（更穩定）
+            H_fg = H_fg.float(); H_bg = H_bg.float()
+
+            # 超參數（可放 args；先給合理預設）
+            tau = getattr(args, "bg_sup_tau", 1.0)     # 抑制強度，1.0 是個安全起點
+            detach_sup = getattr(args, "bg_sup_detach", True)  # 是否在抑制項上做 detach
+            
+            # 準備 target 形狀（你已經有 prep_target_like 類似的函式就沿用）
+            Hfg_s = prep_target_like(H_fg, Hfg_s.float())
+            Hbg_s = prep_target_like(H_bg, Hbg_s.float())
+            
+            # 抑制後 logits：前景被背景壓、背景被前景壓
+            if detach_sup:
+                logits_fg = H_fg - tau * H_bg.detach()
+                logits_bg = H_bg - tau * H_fg.detach()
+            else:
+                logits_fg = H_fg - tau * H_bg
+                logits_bg = H_bg - tau * H_fg
+            
+            # 用 logits 版 focal/BCE 計算（你若用我之前給的 FocalBCEWithLogits 就用它）
+            L_heat = bce(logits_fg, Hfg_s) + bce(logits_bg, Hbg_s)
+
+
+            # Hfg_s = prep_target_like(H_fg, Hfg_s.float())
+            # Hbg_s = prep_target_like(H_bg, Hbg_s.float())
+            
+            # # 目標維度：Hfg_s/Hbg_s 目前是 [B,H,W]；focal 要 [B,1,H,W]
+            # L_heat = bce(H_fg, Hfg_s) + bce(H_bg, Hbg_s)
+            L_cnt  = ce(Pk_fg, Kfg_s) + ce(Pk_bg, Kbg_s)
+            loss   = L_heat + lc * L_cnt
+            
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step(); sch.step(); global_step += 1
             if (global_step % args.log_every)==0:
@@ -811,66 +986,139 @@ def train_loop(args):
             iou = evaluate(args, model, args.manifest_val, eval_loader)
             if best_iou < iou:
                 best_iou = iou
+                lc =  min(lc * 1.05, 0.5)
                 print(f"Best IoU : {best_iou}")
                 os.makedirs(args.out_dir, exist_ok=True)
                 save_checkpoint(os.path.join(args.out_dir, "ppnet_best.pt"),
-                                model, opt, sch, epoch, best_iou)
+                                model, opt, sch, epoch, best_iou, lc)
         
         if (epoch+1) % args.save_every == 0:
             os.makedirs(args.out_dir, exist_ok=True)
             # 以 epoch 命名的留存點
             save_checkpoint(os.path.join(args.out_dir, f"ppnet_epoch{epoch}.pt"),
-                            model, opt, sch, epoch, best_iou)
+                            model, opt, sch, epoch, best_iou, lc)
 
 # ------------------------------ Evaluation ----------------------------
 @torch.inference_mode()
-def evaluate(args, model, manifest_val_path = None, loader = None):
+def evaluate(args, model, manifest_val_path=None, loader=None):
     model.eval()
-    if loader == None:
+    device = next(model.parameters()).device
+
+    if loader is None:
         idx_val = dl.build_coco20i_index(manifest_val_path, fold=args.coco20i_fold, role=args.role)
         base_val = dl.OneShotCOCO20iRoundRobin(index=idx_val, seed=2025, shuffle_classes=True)
         ds_val = COCO20iEpisodeAdapter(base_val, args.cache_dir, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
         loader = DataLoader(ds_val, batch_size=1, shuffle=False)
 
-    ious = []; predictor = sam2_build_image_predictor(args.sam2_cfg, args.sam2_ckpt) if args.val_with_sam2 else None
+    ious = []
+    predictor = sam2_build_image_predictor(args.sam2_cfg, args.sam2_ckpt) if args.val_with_sam2 else None
+    skip = 0
     for batch in loader:
-        x_in   = batch['x_in'].to(device)
-        sam_t  = batch['sam_t'].to(device).squeeze(1)
-        dn_t   = batch['dn_t'].to(device)
+        # --- 移到裝置 ---
+        x_in  = batch['x_in'].to(device)
+        sam_t = batch['sam_t'].to(device).squeeze(1)
+        dn_t  = batch['dn_t'].to(device)
         proto_fg_sam = batch['proto_fg_sam'].to(device).squeeze(1)
         proto_bg_sam = batch['proto_bg_sam'].to(device).squeeze(1)
         proto_fg_dn  = batch['proto_fg_dn'].to(device).squeeze(1)
         proto_bg_dn  = batch['proto_bg_dn'].to(device).squeeze(1)
-        H_fg, H_bg, Pk_fg, Pk_bg = model(x_in, sam_t, dn_t, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
 
-        Hf, Wf = H_fg.shape[-2:]
-        Kfg = int(torch.argmax(Pk_fg, dim=-1).item())
-        Kbg = int(torch.argmax(Pk_bg, dim=-1).item())
-        pts_fg = nms_peaks(H_fg[0,0], Kfg, radius=max(2,int(0.02*max(Hf,Wf))), thresh=0.2)
-        pts_bg = nms_peaks(H_bg[0,0], Kbg, radius=max(2,int(0.02*max(Hf,Wf))), thresh=0.2)
-        pts = pts_fg + pts_bg; labels = [1]*len(pts_fg) + [0]*len(pts_bg)
+        # --- 前向 + logits→prob（評估取點用 prob） ---
+        with torch.no_grad():
+            H_fg, H_bg, Pk_fg, Pk_bg = model(
+                x_in, sam_t, dn_t, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn
+            )
+            H_fg = torch.sigmoid(H_fg)
+            H_bg = torch.sigmoid(H_bg)
+
+        # --- 解析度 & K 值 ---
+        Hf, Wf = H_fg.shape[-2], H_fg.shape[-1]
+        # Pk_* 形狀通常是 [B, Kmax+1]；穩健些用 dim=1
+        Kfg = int(torch.argmax(Pk_fg, dim=1).item())
+        Kbg = int(torch.argmax(Pk_bg, dim=1).item())
+        Kfg = max(0, min(Kfg, args.kmax_f))
+        Kbg = max(0, min(Kbg, args.kmax_b))
+
+        # --- 取峰值 + 後備策略 ---
+        def pick_points(heat_4d, K, nms_radius=5, thresh=0.2):
+            h2d = heat_4d[0, 0] if heat_4d.dim() == 4 else heat_4d
+            pts = nms_peaks(h2d, K, radius=nms_radius, thresh=thresh)  # [(r,c), ...]
+            if len(pts) == 0 and K > 0:
+                # 後備：取 argmax（至少給一個點）
+                rc = torch.nonzero(h2d == h2d.max(), as_tuple=False)[0]
+                pts = [(int(rc[0].item()), int(rc[1].item()))]
+            return pts[:K]
+
+        radius = max(2, int(0.02 * max(Hf, Wf)))
+        pts_fg = pick_points(H_fg, Kfg, nms_radius=radius, thresh=0.2)
+        pts_bg = pick_points(H_bg, Kbg, nms_radius=radius, thresh=0.2)
+
+        # 若前景與背景都不取點（Kfg=Kbg=0），本樣本略過 SAM2 評估
+        if (Kfg + Kbg) == 0:
+            continue
+
+        # --- 組 (N,2) 座標與 (N,) labels（SAM2 需要 x,y 順序） ---
+        def make_coords_labels(pts_fg, pts_bg):
+            fg_xy = np.array([[c, r] for (r, c) in pts_fg], dtype=np.float32)  # (Nf,2)
+            bg_xy = np.array([[c, r] for (r, c) in pts_bg], dtype=np.float32)  # (Nb,2)
+            if fg_xy.size == 0: fg_xy = np.zeros((0, 2), dtype=np.float32)
+            if bg_xy.size == 0: bg_xy = np.zeros((0, 2), dtype=np.float32)
+            coords = np.concatenate([fg_xy, bg_xy], axis=0) if (len(fg_xy) + len(bg_xy)) > 0 \
+                     else np.zeros((0, 2), dtype=np.float32)
+            labels = np.concatenate([
+                np.ones((len(fg_xy),), dtype=np.int32),
+                np.zeros((len(bg_xy),), dtype=np.int32)
+            ], axis=0) if coords.shape[0] > 0 else np.zeros((0,), dtype=np.int32)
+            return coords, labels
+
+        pts_xy, pts_label = make_coords_labels(pts_fg, pts_bg)
+
+        # 若仍是空集合，跳過本樣本
+        if pts_xy.shape[0] == 0:
+            skip+=1
+            continue
 
         if predictor is not None:
-            tgt_rgb_raw = batch['tgt_rgb'][0]
+            # --- 映射到 letterbox 影像座標 ---
+            tgt_rgb_raw = batch['tgt_rgb'][0]                   # HxWx3, uint8
             tgt_rgb_lb, _ = resize_letterbox_rgb(tgt_rgb_raw, args.cache_long)
             H_img, W_img = tgt_rgb_lb.shape[:2]
-            pts_xy = np.array([grid_to_xy(rc, Hf, Wf, H_img, W_img) for rc in pts], dtype=np.int32)
+
+            # 將 feature grid (Hf,Wf) 座標映射到 letterbox 影像 (H_img,W_img)
+            pts_xy = np.array(
+                [grid_to_xy((int(y), int(x)), Hf, Wf, H_img, W_img) for (x, y) in pts_xy],
+                dtype=np.int32
+            ).astype(np.float32)
+
+            # --- SAM2 預測 ---
             predictor.set_image(tgt_rgb_lb)
-            masks, scores, _ = predictor.predict(point_coords=pts_xy.astype(np.float32),
-                                                    point_labels=np.array(labels, dtype=np.int32),
-                                                    multimask_output=True)
-            j = int(np.argmax(scores)); m = masks[j].astype(np.uint8)
+            masks, scores, _ = predictor.predict(
+                point_coords=pts_xy,                  # (N,2) float32
+                point_labels=pts_label.astype(np.int32),  # (N,)
+                multimask_output=True
+            )
+            j = int(np.argmax(scores))
+            m = masks[j].astype(np.uint8)
+
+            # --- GT 準備（letterbox 一致） ---
             gt_raw = batch['tgt_mask'][0]
             gt_lb = resize_letterbox_mask(gt_raw, args.cache_long)
-            gt = (gt_lb>127).astype(np.uint8)
-            inter = (m>0)&(gt>0); union = (m>0)|(gt>0)
-            iou = float(inter.sum())/float(union.sum()+1e-6)
-            ious.append(iou)
-            if args.val_samples>0 and len(ious)>=args.val_samples: break
+            gt = (gt_lb > 127).astype(np.uint8)
 
+            # --- IoU ---
+            inter = (m > 0) & (gt > 0)
+            union = (m > 0) | (gt > 0)
+            iou = float(inter.sum()) / float(union.sum() + 1e-6)
+            ious.append(iou)
+
+            if args.val_samples > 0 and len(ious) >= args.val_samples:
+                break
+    
+    print(f"skipping times: {skip}")
     if ious:
-        print(f"Val mIoU (SAM2) over {len(ious)}: {np.mean(ious):.4f}")
-        return np.mean(ious)
+        miou = float(np.mean(ious))
+        print(f"Val mIoU (SAM2) over {len(ious)}: {miou:.4f}")
+        return miou
     else:
         return 0.0
 # ------------------------------ CSV utils -----------------------------
@@ -921,19 +1169,20 @@ def run_infer(args):
     sam_t = feats['sam_feat_tgt'].unsqueeze(0)  # [1,Cs,Hf,Wf]
     dn_t  = feats['dino_feat_tgt'].permute(2,0,1)  # [Cd,Gh,Gw]
     predictor = sam2_build_image_predictor(args.sam2_cfg, args.sam2_ckpt)
-    feats = compute_proto_and_sims(ref_rgb, ref_mask, tgt_rgb, predictor, args.dinov3_model_id, use_bg_proto=True)
-    sam_t = feats['sam_feat_tgt'].unsqueeze(0)  # [1,Cs,Hf,Wf]
-    dn_t  = feats['dino_feat_tgt'].permute(2,0,1)  # [Cd,Gh,Gw]
+    
     Hf,Wf = sam_t.shape[-2:]
     sim_dn_up = F.interpolate(feats['sim_dino'].unsqueeze(0).unsqueeze(0), size=(Hf,Wf), mode='bicubic', align_corners=False).squeeze(0).squeeze(0)
     edge = sobel_edge_hint(tgt_rgb, (Hf,Wf))
     x_in = torch.stack([feats['sim_sam'], sim_dn_up, (feats['sim_sam']+sim_dn_up)/2.0, 1.0-(feats['sim_sam']+sim_dn_up)/2.0, edge], dim=0).unsqueeze(0).to(device)
-    model = PointPromptNetB(c_in=x_in.shape[1], kmax=args.kmax).to(device)
+    model = PointPromptNetB(c_in=x_in.shape[1], kmax_f=args.kmax_f, kmax_b= args.kmax_b).to(device)
     ckpt = torch.load(args.ckpt, map_location=device) if args.ckpt else None
     if ckpt: model.load_state_dict(ckpt['model'], strict=False)
     H_fg, H_bg, Pk_fg, Pk_bg = model(x_in.to(device), sam_t.to(device), dn_t.to(device),
                                      feats['proto_fg_sam'].unsqueeze(0), feats['proto_bg_sam'].unsqueeze(0),
                                      feats['proto_fg_dn'].unsqueeze(0), feats['proto_bg_dn'].unsqueeze(0))
+    H_fg = torch.sigmoid(H_fg)  # ← 新增
+    H_bg = torch.sigmoid(H_bg)  # ← 新增
+    
     Kfg = int(torch.argmax(Pk_fg, dim=-1).item()); Kbg = int(torch.argmax(Pk_bg, dim=-1).item())
     pts_fg = nms_peaks(H_fg[0,0], Kfg, radius=max(2,int(0.02*max(Hf,Wf))), thresh=0.2)
     pts_bg = nms_peaks(H_bg[0,0], Kbg, radius=max(2,int(0.02*max(Hf,Wf))), thresh=0.2)
@@ -973,7 +1222,8 @@ def parse_args():
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--wd', type=float, default=1e-2)
-    p.add_argument('--kmax', type=int, default=8)
+    p.add_argument('--kmax_f', type=int, default=8)
+    p.add_argument('--kmax_b', type=int, default=8)
     p.add_argument('--lc', type=float, default=0.2, help='weight for count loss')
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--eval-every', type=int, default=1)
@@ -981,6 +1231,7 @@ def parse_args():
     p.add_argument('--out-dir', type=str, default='outputs/ckpts')
     p.add_argument('--build-cache', action='store_true')
     p.add_argument('--train', action='store_true')
+    p.add_argument('--bg-sup-tau')
     p.add_argument('--val-with-sam2', action='store_true')
     p.add_argument('--val-samples', type=int, default=128)
     p.add_argument('--torch-compile', action='store_true')
