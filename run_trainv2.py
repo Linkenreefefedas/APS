@@ -1,25 +1,3 @@
-# runv3.py — Train PointPromptNet‑B (~1.55M) to emit SAM2 point prompts
-# ---------------------------------------------------------------------
-# This script keeps SAM2 completely out of the training loss (no E2E with SAM2).
-# Supervision is on (1) foreground / background point heatmaps and (2) point counts.
-# It reuses encoder-level features from SAM2 and DINOv3; features are precomputed & cached
-# for efficient training on a single A100. Validation can optionally call SAM2 to report mIoU.
-#
-# Quick start
-# 1) Prepare a CSV with columns: target, target_mask, ref, ref_mask, split (train/val).
-# 2) Build feature cache (fast offline step):
-#    python runv3.py --csv episodes.csv --cache-dir cache --sam2-cfg configs/sam2.1/sam2.1_hiera_s.yaml \
-#                    --sam2-ckpt checkpoints/sam2.1_hiera_small.pt --dinov3-model-id facebook/dinov3-vitb16-pretrain-lvd1689m \
-#                    --build-cache
-# 3) Train:
-#    python runv3.py --csv episodes.csv --cache-dir cache --epochs 80 --batch-size 24 --lr 1e-3 --kmax 8 \
-#                    --sam2-cfg configs/sam2.1/sam2.1_hiera_s.yaml --sam2-ckpt checkpoints/sam2.1_hiera_small.pt \
-#                    --dinov3-model-id facebook/dinov3-vitb16-pretrain-lvd1689m --train
-# 4) Validate with SAM2 for true mIoU (optional, slower): add --val-with-sam2 --val-samples 128
-# 5) Inference on one episode (save overlay):
-#    python runv3.py --infer --target path.jpg --target-mask path.png --ref path.jpg --ref-mask path.png \
-#                    --sam2-cfg ... --sam2-ckpt ... --dinov3-model-id ...
-
 import os, math, csv, json, time, random
 import argparse
 from dataclasses import dataclass
@@ -216,14 +194,14 @@ def get_grid_feats_dinov3_hf(image_rgb: np.ndarray, model_id: str) -> torch.Tens
     assert x.dim() in (3,4)
     if x.dim()==4:
         grid = x[0].permute(1,2,0).contiguous()
-        return F.normalize(grid, dim=-1, eps=1e-6).to(torch.float32)
+        return F.normalize(grid, dim=-1).to(torch.float32)
     Hp, Wp = inputs["pixel_values"].shape[-2:]
     psize = int(getattr(getattr(model, "config", None), "patch_size", 16))
     Gh, Gw = Hp//psize, Wp//psize
     M = Gh*Gw
     toks = x[0, -M:, :]
     grid = toks.view(Gh, Gw, -1).contiguous()
-    return F.normalize(grid, dim=-1, eps=1e-6).to(torch.float32)
+    return F.normalize(grid, dim=-1).to(torch.float32)
 
 # ------------------------------ SAM2 image encoder ---------------------
 def sam2_build_image_predictor(cfg_yaml: str, ckpt_path: str):
@@ -255,7 +233,7 @@ def get_sam2_feat(image_rgb: np.ndarray, predictor, use_autocast: bool=False) ->
     with AutocastCtx(use_autocast):
         predictor.set_image(image_rgb)
     feat = _extract_sam2_image_embed(predictor)  # [C,Hf,Wf]
-    return F.normalize(feat, dim=0, eps=1e-6).to(torch.float32)
+    return F.normalize(feat, dim=0).to(torch.float32)
 
 # ------------------------------ Prototypes & sims ----------------------
 def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
@@ -272,14 +250,14 @@ def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
     m_small = torch.from_numpy(m_small).to(device=tgt_sam.device, dtype=torch.float32)
     fg = (m_small>0.5).float(); bg = (m_small<=0.5).float()
     proto_fg_sam = (ref_sam * fg.unsqueeze(0)).sum((1,2)) / (fg.sum()+1e-8)
-    proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
+    proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
     sim_fg_sam = (tgt_sam * proto_fg_sam.view(-1,1,1)).sum(0)
     if use_bg_proto:
         if bg.sum()<1:
             inv = (1.0-m_small).flatten(); topk = torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hf,Wf)
         proto_bg_sam = (ref_sam * bg.unsqueeze(0)).sum((1,2)) / (bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
         sim_sam = torch.sigmoid((sim_fg_sam - (tgt_sam * proto_bg_sam.view(-1,1,1)).sum(0))/tau)
     else:
         sim_sam = (sim_fg_sam+1.0)/2.0
@@ -292,11 +270,11 @@ def compute_proto_and_sims(ref_rgb: np.ndarray, ref_mask: np.ndarray,
     m_small2 = torch.from_numpy(m_small2).to(device=tgt_grid.device, dtype=torch.float32)
     fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
     proto_fg_dn = (ref_grid * fg2.unsqueeze(-1)).sum((0,1)) / (fg2.sum()+1e-8)
-    proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
+    proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
     sim_fg_dn = (tgt_grid * proto_fg_dn.view(1,1,-1)).sum(-1)
     if use_bg_proto:
         proto_bg_dn = (ref_grid * bg2.unsqueeze(-1)).sum((0,1)) / (bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
         sim_dn = torch.sigmoid((sim_fg_dn - (tgt_grid * proto_bg_dn.view(1,1,-1)).sum(-1))/tau)
     else:
         sim_dn = (sim_fg_dn+1.0)/2.0
@@ -629,13 +607,13 @@ class EpisodeDataset(Dataset):
         m_small = torch.from_numpy(m_small)
         fg = (m_small>0.5).float(); bg = (m_small<=0.5).float()
         proto_fg_sam = (sam_r * fg.unsqueeze(0)).sum((1,2))/(fg.sum()+1e-8)
-        proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
+        proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
         sim_fg_sam = (sam_t * proto_fg_sam.view(-1,1,1)).sum(0)
         if bg.sum()<1:
             inv = (1.0-m_small).flatten(); topk=torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hf,Wf)
         proto_bg_sam = (sam_r * bg.unsqueeze(0)).sum((1,2))/(bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
         sim_bg_sam = (sam_t * proto_bg_sam.view(-1,1,1)).sum(0)
         sim_sam = torch.sigmoid((sim_fg_sam - sim_bg_sam)/0.2).to(torch.float32)
         # dino
@@ -644,10 +622,10 @@ class EpisodeDataset(Dataset):
         m_small2 = torch.from_numpy(m_small2)
         fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
         proto_fg_dn = (dn_r * fg2.unsqueeze(0)).sum((1,2))/(fg2.sum()+1e-8)
-        proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
+        proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
         sim_fg_dn = (dn_t * proto_fg_dn.view(-1,1,1)).sum(0)
         proto_bg_dn = (dn_r * bg2.unsqueeze(0)).sum((1,2))/(bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
         sim_bg_dn = (dn_t * proto_bg_dn.view(-1,1,1)).sum(0)
         sim_dn = torch.sigmoid((sim_fg_dn - sim_bg_dn)/0.2).to(torch.float32)
         # upsample sims to Hf,Wf
@@ -721,14 +699,14 @@ class COCO20iEpisodeAdapter(Dataset):
         bg = (m_small <= 0.5).float()
     
         proto_fg_sam = (sam_r * fg.unsqueeze(0)).sum((1,2)) / (fg.sum()+1e-8)
-        proto_fg_sam = F.normalize(proto_fg_sam, dim=0, eps=1e-6)
+        proto_fg_sam = F.normalize(proto_fg_sam, dim=0)
         sim_fg_sam = (sam_t * proto_fg_sam.view(-1,1,1)).sum(0)
     
         if bg.sum() < 1:
             inv = (1.0-m_small).flatten(); topk = torch.topk(inv, k=min(10, inv.numel()))[1]
             bg = torch.zeros_like(inv); bg[topk]=1.0; bg = bg.view(Hr,Wr)
         proto_bg_sam = (sam_r * bg.unsqueeze(0)).sum((1,2)) / (bg.sum()+1e-8)
-        proto_bg_sam = F.normalize(proto_bg_sam, dim=0, eps=1e-6)
+        proto_bg_sam = F.normalize(proto_bg_sam, dim=0)
         sim_bg_sam = (sam_t * proto_bg_sam.view(-1,1,1)).sum(0)
     
         sim_sam = torch.sigmoid((sim_fg_sam - sim_bg_sam)/0.2).to(torch.float32)
@@ -740,11 +718,11 @@ class COCO20iEpisodeAdapter(Dataset):
         fg2 = (m_small2>0.5).float(); bg2 = (m_small2<=0.5).float()
     
         proto_fg_dn = (dn_r * fg2.unsqueeze(0)).sum((1,2))/(fg2.sum()+1e-8)
-        proto_fg_dn = F.normalize(proto_fg_dn, dim=0, eps=1e-6)
+        proto_fg_dn = F.normalize(proto_fg_dn, dim=0)
         sim_fg_dn = (dn_t * proto_fg_dn.view(-1,1,1)).sum(0)
     
         proto_bg_dn = (dn_r * bg2.unsqueeze(0)).sum((1,2))/(bg2.sum()+1e-8)
-        proto_bg_dn = F.normalize(proto_bg_dn, dim=0, eps=1e-6)
+        proto_bg_dn = F.normalize(proto_bg_dn, dim=0)
         sim_bg_dn = (dn_t * proto_bg_dn.view(-1,1,1)).sum(0)
     
         sim_dn = torch.sigmoid((sim_fg_dn - sim_bg_dn)/0.2).to(torch.float32)
@@ -899,7 +877,7 @@ def train_loop(args):
         model = torch.compile(model, mode='reduce-overhead')
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs*max(1,len(dl_torch)))
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.all_epochs*max(1,len(dl_torch)))
     bce = FocalBCEWithLogits(alpha=0.25, gamma=2.0)
     ce  = nn.CrossEntropyLoss()
 
@@ -938,37 +916,15 @@ def train_loop(args):
             proto_fg_dn  = batch['proto_fg_dn'].to(device).squeeze(1)
             proto_bg_dn  = batch['proto_bg_dn'].to(device).squeeze(1)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type=="cuda")):
-                H_fg, H_bg, Pk_fg, Pk_bg = model(x_in, sam_t, dn_t, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
+            H_fg, H_bg, Pk_fg, Pk_bg = model(x_in, sam_t, dn_t, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
             
-            # ↓↓↓ logits/targets 轉成 float32 再算 loss（更穩定）
             H_fg = H_fg.float(); H_bg = H_bg.float()
 
-            # 超參數（可放 args；先給合理預設）
-            tau = getattr(args, "bg_sup_tau", 1.0)     # 抑制強度，1.0 是個安全起點
-            detach_sup = getattr(args, "bg_sup_detach", True)  # 是否在抑制項上做 detach
-            
-            # 準備 target 形狀（你已經有 prep_target_like 類似的函式就沿用）
             Hfg_s = prep_target_like(H_fg, Hfg_s.float())
             Hbg_s = prep_target_like(H_bg, Hbg_s.float())
             
-            # 抑制後 logits：前景被背景壓、背景被前景壓
-            if detach_sup:
-                logits_fg = H_fg - tau * H_bg.detach()
-                logits_bg = H_bg - tau * H_fg.detach()
-            else:
-                logits_fg = H_fg - tau * H_bg
-                logits_bg = H_bg - tau * H_fg
-            
-            # 用 logits 版 focal/BCE 計算（你若用我之前給的 FocalBCEWithLogits 就用它）
-            L_heat = bce(logits_fg, Hfg_s) + bce(logits_bg, Hbg_s)
-
-
-            # Hfg_s = prep_target_like(H_fg, Hfg_s.float())
-            # Hbg_s = prep_target_like(H_bg, Hbg_s.float())
-            
-            # # 目標維度：Hfg_s/Hbg_s 目前是 [B,H,W]；focal 要 [B,1,H,W]
-            # L_heat = bce(H_fg, Hfg_s) + bce(H_bg, Hbg_s)
+            # 目標維度：Hfg_s/Hbg_s 目前是 [B,H,W]；focal 要 [B,1,H,W]
+            L_heat = bce(H_fg, Hfg_s) + bce(H_bg, Hbg_s)
             L_cnt  = ce(Pk_fg, Kfg_s) + ce(Pk_bg, Kbg_s)
             loss   = L_heat + lc * L_cnt
             
@@ -986,8 +942,8 @@ def train_loop(args):
             iou = evaluate(args, model, args.manifest_val, eval_loader)
             if best_iou < iou:
                 best_iou = iou
-                lc =  min(lc * 1.05, 0.5)
-                print(f"Best IoU : {best_iou}")
+                lc =  min(lc * 1.05, 0.3)
+                print(f"Best IoU : {best_iou}\n")
                 os.makedirs(args.out_dir, exist_ok=True)
                 save_checkpoint(os.path.join(args.out_dir, "ppnet_best.pt"),
                                 model, opt, sch, epoch, best_iou, lc)
@@ -997,6 +953,7 @@ def train_loop(args):
             # 以 epoch 命名的留存點
             save_checkpoint(os.path.join(args.out_dir, f"ppnet_epoch{epoch}.pt"),
                             model, opt, sch, epoch, best_iou, lc)
+            print('Save checkpt.')
 
 # ------------------------------ Evaluation ----------------------------
 @torch.inference_mode()
@@ -1218,6 +1175,7 @@ def parse_args():
     p.add_argument('--sam2-ckpt', type=str, required=False, default='checkpoints/sam2.1_hiera_small.pt')
     p.add_argument('--dinov3-model-id', type=str, default='facebook/dinov3-vitb16-pretrain-lvd1689m')
     p.add_argument('--epochs', type=int, default=80)
+    p.add_argument('--all-epochs', type=int, default=100)
     p.add_argument('--batch-size', type=int, default=24)
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--lr', type=float, default=1e-3)
@@ -1231,7 +1189,6 @@ def parse_args():
     p.add_argument('--out-dir', type=str, default='outputs/ckpts')
     p.add_argument('--build-cache', action='store_true')
     p.add_argument('--train', action='store_true')
-    p.add_argument('--bg-sup-tau')
     p.add_argument('--val-with-sam2', action='store_true')
     p.add_argument('--val-samples', type=int, default=128)
     p.add_argument('--torch-compile', action='store_true')

@@ -7,7 +7,7 @@ from PIL import Image
 from tqdm import tqdm
 from pycocotools.coco import COCO
 import pycocotools.mask as maskUtils
-
+import argparse
 import hashlib
 
 COCO_ROOT = "/content/COCO2017"
@@ -336,21 +336,33 @@ class OneShotCOCO20iRoundRobin(Dataset):
     def reset(self):
         self.plan = self._build_plan()
 
+def parse_args():
+    p = argparse.ArgumentParser('Dataloader')
+    p.add_argument('--shard-count', type=int, default=5,
+                       help='把要快取的影像切成 shard-count 份（依排序索引取模）')
+    p.add_argument('--shard-idx', type=int, default=0,
+                    help='本分頁要處理哪一份（0..shard-count-1）')
+    return p.parse_args()
+    
+
 if __name__ == "__main__":
+    args = parse_args()
+    preprocess_split("train", include_crowd=False, shard_count=args.shard_count, shard_idx=args.shard_idx)
+    preprocess_split("val", include_crowd=False, shard_count=args.shard_count, shard_idx=args.shard_idx)
     # preprocess_split("train", include_crowd=False)
     # preprocess_split("val",   include_crowd=False)
-    preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=0)
-    preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=0)
+    # preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=0)
+    # preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=0)
 
-    preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=1)
-    preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=1)
+    # preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=1)
+    # preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=1)
 
-    preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=2)
-    preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=2)
+    # preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=2)
+    # preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=2)
 
-    preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=3)
-    preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=3)
+    # preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=3)
+    # preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=3)
 
-    preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=4)
-    preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=4)
+    # preprocess_split("train", include_crowd=False, shard_count=5, shard_idx=4)
+    # preprocess_split("val", include_crowd=False, shard_count=5, shard_idx=4)
     
