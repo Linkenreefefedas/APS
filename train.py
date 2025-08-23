@@ -1,144 +1,144 @@
 # train_rl.py
-# ---- SAM2 快取 I/O 猴子補丁：讓任何版本都有 set_image_from_cache / export_cache ----
-def _monkey_patch_sam2_cache_io():
-    import functools, types, torch
-    try:
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-    except Exception:
-        # 你的匯入別名若不同，改這行
-        from sam2_image_predictor import SAM2ImagePredictor
+# # ---- SAM2 快取 I/O 猴子補丁：讓任何版本都有 set_image_from_cache / export_cache ----
+# def _monkey_patch_sam2_cache_io():
+#     import functools, types, torch
+#     try:
+#         from sam2.sam2_image_predictor import SAM2ImagePredictor
+#     except Exception:
+#         # 你的匯入別名若不同，改這行
+#         from sam2_image_predictor import SAM2ImagePredictor
 
-    if hasattr(SAM2ImagePredictor, "set_image_from_cache") and hasattr(SAM2ImagePredictor, "export_cache"):
-        return  # 已有就不重覆貼
+#     if hasattr(SAM2ImagePredictor, "set_image_from_cache") and hasattr(SAM2ImagePredictor, "export_cache"):
+#         return  # 已有就不重覆貼
 
-    def _as_hw_tuple(val):
-        import numpy as np
-        if val is None: return None
-        if isinstance(val, int): return (int(val), int(val))
-        if isinstance(val, (tuple, list)):
-            if len(val) >= 2: return (int(val[-2]), int(val[-1]))
-            if len(val) == 1:  return (int(val[0]), int(val[0]))
-            return None
-        if isinstance(val, torch.Tensor):
-            v = val.detach().cpu().flatten().tolist()
-            if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-            if len(v) == 1:  return (int(v[0]), int(v[0]))
-            return None
-        try:
-            import numpy as np
-            if isinstance(val, np.ndarray):
-                v = val.flatten().tolist()
-                if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-                if len(v) == 1:  return (int(v[0]), int(v[0]))
-        except Exception:
-            pass
-        return None
+#     def _as_hw_tuple(val):
+#         import numpy as np
+#         if val is None: return None
+#         if isinstance(val, int): return (int(val), int(val))
+#         if isinstance(val, (tuple, list)):
+#             if len(val) >= 2: return (int(val[-2]), int(val[-1]))
+#             if len(val) == 1:  return (int(val[0]), int(val[0]))
+#             return None
+#         if isinstance(val, torch.Tensor):
+#             v = val.detach().cpu().flatten().tolist()
+#             if len(v) >= 2: return (int(v[-2]), int(v[-1]))
+#             if len(v) == 1:  return (int(v[0]), int(v[0]))
+#             return None
+#         try:
+#             import numpy as np
+#             if isinstance(val, np.ndarray):
+#                 v = val.flatten().tolist()
+#                 if len(v) >= 2: return (int(v[-2]), int(v[-1]))
+#                 if len(v) == 1:  return (int(v[0]), int(v[0]))
+#         except Exception:
+#             pass
+#         return None
 
-    @torch.no_grad()
-    def set_image_from_cache(self, cache: dict) -> None:
-        assert isinstance(cache, dict), "cache must be a dict"
+#     @torch.no_grad()
+#     def set_image_from_cache(self, cache: dict) -> None:
+#         assert isinstance(cache, dict), "cache must be a dict"
 
-        # 1) 取 embedding 與 pyramid
-        img_key = None
-        for k in ("image_embed", "image_embeddings", "image_features", "vision_feats"):
-            if k in cache: img_key = k; break
-        if img_key is None:
-            raise KeyError("cache missing image embedding (image_embed / image_embeddings / ...)")
+#         # 1) 取 embedding 與 pyramid
+#         img_key = None
+#         for k in ("image_embed", "image_embeddings", "image_features", "vision_feats"):
+#             if k in cache: img_key = k; break
+#         if img_key is None:
+#             raise KeyError("cache missing image embedding (image_embed / image_embeddings / ...)")
 
-        image_embed = cache[img_key]
-        high_res = cache.get("high_res_feats", None)
-        if high_res is None:
-            raise KeyError("cache missing 'high_res_feats' (list of tensors). Please rebuild cache with export_cache().")
+#         image_embed = cache[img_key]
+#         high_res = cache.get("high_res_feats", None)
+#         if high_res is None:
+#             raise KeyError("cache missing 'high_res_feats' (list of tensors). Please rebuild cache with export_cache().")
 
-        dev = self.device
-        to_dev_fp32 = lambda x: (x if isinstance(x, torch.Tensor) else torch.as_tensor(x)).to(dev).to(torch.float32)
+#         dev = self.device
+#         to_dev_fp32 = lambda x: (x if isinstance(x, torch.Tensor) else torch.as_tensor(x)).to(dev).to(torch.float32)
 
-        # squeeze 可能的 batch 維
-        if isinstance(image_embed, list):
-            image_embed = image_embed[0]
-        if isinstance(image_embed, torch.Tensor) and image_embed.dim() == 5 and image_embed.size(0) == 1:
-            image_embed = image_embed[0]
-        image_embed = to_dev_fp32(image_embed)
+#         # squeeze 可能的 batch 維
+#         if isinstance(image_embed, list):
+#             image_embed = image_embed[0]
+#         if isinstance(image_embed, torch.Tensor) and image_embed.dim() == 5 and image_embed.size(0) == 1:
+#             image_embed = image_embed[0]
+#         image_embed = to_dev_fp32(image_embed)
 
-        assert isinstance(high_res, (list, tuple)) and len(high_res) > 0, "high_res_feats must be non-empty list"
-        high_res = [to_dev_fp32(t) for t in high_res]
+#         assert isinstance(high_res, (list, tuple)) and len(high_res) > 0, "high_res_feats must be non-empty list"
+#         high_res = [to_dev_fp32(t) for t in high_res]
 
-        # 2) 尺寸 → (H, W)
-        orig_hw = (_as_hw_tuple(cache.get("original_size"))
-                   or _as_hw_tuple(cache.get("orig_size"))
-                   or _as_hw_tuple(cache.get("original_size_hw")))
-        if orig_hw is None:
-            s = int(getattr(self.model, "image_size", 1024)); orig_hw = (s, s)
+#         # 2) 尺寸 → (H, W)
+#         orig_hw = (_as_hw_tuple(cache.get("original_size"))
+#                    or _as_hw_tuple(cache.get("orig_size"))
+#                    or _as_hw_tuple(cache.get("original_size_hw")))
+#         if orig_hw is None:
+#             s = int(getattr(self.model, "image_size", 1024)); orig_hw = (s, s)
 
-        # 3) 寫回 predictor 狀態
-        self._features = {"image_embed": image_embed, "high_res_feats": high_res}
-        self._orig_hw = [tuple(orig_hw)]
-        self._is_image_set = True
-        self._is_batch = False
+#         # 3) 寫回 predictor 狀態
+#         self._features = {"image_embed": image_embed, "high_res_feats": high_res}
+#         self._orig_hw = [tuple(orig_hw)]
+#         self._is_image_set = True
+#         self._is_batch = False
 
-        # 4) 補丁 transforms（支援 normalize 等 kwargs 與 int → (H,W)）
-        tr = getattr(self, "_transforms", None)
-        if tr is not None and hasattr(tr, "transform_coords") and not getattr(tr, "_patched_accepts_kwargs", False):
-            old = tr.transform_coords
-            @functools.wraps(old)
-            def wrapped(coords, *args, **kwargs):
-                if 'orig_hw' in kwargs:
-                    ohw = _as_hw_tuple(kwargs['orig_hw'])
-                    if ohw is not None: kwargs['orig_hw'] = ohw
-                elif len(args) >= 1:
-                    ohw = _as_hw_tuple(args[0])
-                    if ohw is not None: args = (ohw,) + args[1:]
-                return old(coords, *args, **kwargs)
-            tr.transform_coords = wrapped
-            tr._patched_accepts_kwargs = True
+#         # 4) 補丁 transforms（支援 normalize 等 kwargs 與 int → (H,W)）
+#         tr = getattr(self, "_transforms", None)
+#         if tr is not None and hasattr(tr, "transform_coords") and not getattr(tr, "_patched_accepts_kwargs", False):
+#             old = tr.transform_coords
+#             @functools.wraps(old)
+#             def wrapped(coords, *args, **kwargs):
+#                 if 'orig_hw' in kwargs:
+#                     ohw = _as_hw_tuple(kwargs['orig_hw'])
+#                     if ohw is not None: kwargs['orig_hw'] = ohw
+#                 elif len(args) >= 1:
+#                     ohw = _as_hw_tuple(args[0])
+#                     if ohw is not None: args = (ohw,) + args[1:]
+#                 return old(coords, *args, **kwargs)
+#             tr.transform_coords = wrapped
+#             tr._patched_accepts_kwargs = True
 
-    @torch.no_grad()
-    def export_cache(self) -> dict:
-        if not getattr(self, "_is_image_set", False) or self._features is None:
-            raise RuntimeError("Call set_image(...) before export_cache().")
-        def to_cpu_fp16(x: torch.Tensor): return x.detach().to("cpu").contiguous().to(torch.float16)
+#     @torch.no_grad()
+#     def export_cache(self) -> dict:
+#         if not getattr(self, "_is_image_set", False) or self._features is None:
+#             raise RuntimeError("Call set_image(...) before export_cache().")
+#         def to_cpu_fp16(x: torch.Tensor): return x.detach().to("cpu").contiguous().to(torch.float16)
 
-        # image_embed / high_res_feats
-        img_key = "image_embed" if "image_embed" in self._features else \
-                  ("image_embeddings" if "image_embeddings" in self._features else None)
-        if img_key is None:
-            raise KeyError("predictor._features lacks image embedding key")
-        pack = {
-            "image_embed": to_cpu_fp16(self._features[img_key]),
-        }
-        hrs = self._features.get("high_res_feats", None)
-        assert isinstance(hrs, list) and len(hrs) > 0, "high_res_feats missing in predictor._features"
-        pack["high_res_feats"] = [to_cpu_fp16(t) for t in hrs]
+#         # image_embed / high_res_feats
+#         img_key = "image_embed" if "image_embed" in self._features else \
+#                   ("image_embeddings" if "image_embeddings" in self._features else None)
+#         if img_key is None:
+#             raise KeyError("predictor._features lacks image embedding key")
+#         pack = {
+#             "image_embed": to_cpu_fp16(self._features[img_key]),
+#         }
+#         hrs = self._features.get("high_res_feats", None)
+#         assert isinstance(hrs, list) and len(hrs) > 0, "high_res_feats missing in predictor._features"
+#         pack["high_res_feats"] = [to_cpu_fp16(t) for t in hrs]
 
-        # sizes
-        if isinstance(getattr(self, "_orig_hw", None), list) and len(self._orig_hw) > 0:
-            ohw = _as_hw_tuple(self._orig_hw[0])
-        else:
-            s = int(getattr(self.model, "image_size", 1024)); ohw = (s, s)
-        pack["original_size"] = tuple(ohw)
-        pack["orig_size"]     = tuple(ohw)
-        pack["input_size"]    = tuple(ohw)
+#         # sizes
+#         if isinstance(getattr(self, "_orig_hw", None), list) and len(self._orig_hw) > 0:
+#             ohw = _as_hw_tuple(self._orig_hw[0])
+#         else:
+#             s = int(getattr(self.model, "image_size", 1024)); ohw = (s, s)
+#         pack["original_size"] = tuple(ohw)
+#         pack["orig_size"]     = tuple(ohw)
+#         pack["input_size"]    = tuple(ohw)
 
-        # optional padded size
-        pinp = getattr(self._transforms, "padded_input_image_size", None)
-        pinp = _as_hw_tuple(pinp) or ohw
-        pack["padded_input_image_size"] = tuple(pinp)
+#         # optional padded size
+#         pinp = getattr(self._transforms, "padded_input_image_size", None)
+#         pinp = _as_hw_tuple(pinp) or ohw
+#         pack["padded_input_image_size"] = tuple(pinp)
 
-        # meta（你要記錄的欄位）
-        pack["meta"] = {
-            "sizes_saved_as_tuple": True,
-            "original_size_hw": tuple(ohw),
-            "input_size_hw": tuple(ohw),
-            "has_high_res_feats": True,
-            "high_res_feats_levels": len(pack["high_res_feats"]),
-        }
-        return pack
+#         # meta（你要記錄的欄位）
+#         pack["meta"] = {
+#             "sizes_saved_as_tuple": True,
+#             "original_size_hw": tuple(ohw),
+#             "input_size_hw": tuple(ohw),
+#             "has_high_res_feats": True,
+#             "high_res_feats_levels": len(pack["high_res_feats"]),
+#         }
+#         return pack
 
-    # 掛到類別上
-    SAM2ImagePredictor.set_image_from_cache = set_image_from_cache
-    SAM2ImagePredictor.export_cache = export_cache
+#     # 掛到類別上
+#     SAM2ImagePredictor.set_image_from_cache = set_image_from_cache
+#     SAM2ImagePredictor.export_cache = export_cache
 
-_monkey_patch_sam2_cache_io()
+# _monkey_patch_sam2_cache_io()
 import os, math, csv, json, time, random, hashlib
 import argparse
 from dataclasses import dataclass
@@ -274,7 +274,7 @@ def _force_size_attrs(predictor, hw_tuple):
         except Exception: pass
 
 # ---- Letterbox helpers ----
-def resize_letterbox_rgb(rgb: np.ndarray, fixed_size: int = 1024) -> tuple[np.ndarray, dict]:
+def resize_rgb(rgb: np.ndarray, fixed_size: int = 1024) -> tuple[np.ndarray, dict]:
     H, W = rgb.shape[:2]
     if max(H, W) == 0:
         raise ValueError("Invalid image size")
@@ -284,7 +284,7 @@ def resize_letterbox_rgb(rgb: np.ndarray, fixed_size: int = 1024) -> tuple[np.nd
                 scale=1.0, orig_h=H, orig_w=W)
     return out, meta
 
-def resize_letterbox_mask(mask: np.ndarray, fixed_size: int = 1024, k=None) -> np.ndarray:
+def resize_mask(mask: np.ndarray, fixed_size: int = 1024, k=None) -> np.ndarray:
     out = cv2.resize(mask, (fixed_size, fixed_size), interpolation=cv2.INTER_NEAREST)
     return out
 
@@ -321,82 +321,23 @@ def get_grid_feats_dinov3_hf(image_rgb: np.ndarray, model_id: str) -> torch.Tens
 # ------------------------------ SAM2 predictor / cache -----------------
 
 def sam2_build_image_predictor(cfg_yaml: str, ckpt_path: str):
+    import sys, importlib
+
+    # 保證本地 sam2 在 sys.path 最前面
+    sys.path.insert(0, "/content/sam2")
+
+    # 把已載入的 sam2 模組（含子模組）移除，避免抓舊的
+    for m in list(sys.modules):
+        if m == "sam2" or m.startswith("sam2."):
+            del sys.modules[m]
     from sam2.build_sam import build_sam2
+    import sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
+    print("sam2 package path:", sam2.__file__)
+    import sam2.sam2_image_predictor as sip
+    print("predictor path:", sip.__file__)
     model = build_sam2(cfg_yaml, ckpt_path).to(device)
     return SAM2ImagePredictor(model)
-
-def _get_predictor_features_dict(predictor) -> dict:
-    """
-    從 SAM2ImagePredictor 把 set_image 後的特徵抽出成 CPU/FP16 字典，
-    並把尺寸鍵一律正規化為 (H, W) tuple。
-    """
-    feats = None
-    for attr in ("_features", "features"):
-        if hasattr(predictor, attr):
-            d = getattr(predictor, attr)
-            if isinstance(d, dict):
-                feats = d; break
-    if feats is None:
-        raise RuntimeError("SAM2 predictor has no feature dict (_features/features)")
-
-    want_keys = {
-        "image_embeddings", "image_embed", "image_features", "vision_feats",
-        "high_res_feats",   # ★ 新增
-        "image_pe", "positional_encoding",
-        "input_size", "original_size", "orig_size"
-    }
-
-    def _as_hw_tuple(val, fallback=None):
-        import numpy as np, torch as _torch
-        if val is None: return fallback
-        if isinstance(val, int): return (int(val), int(val))
-        if isinstance(val, (tuple, list)):
-            if len(val) >= 2: return (int(val[-2]), int(val[-1]))
-            if len(val) == 1:  return (int(val[0]), int(val[0]))
-            return fallback
-        if isinstance(val, _torch.Tensor):
-            v = val.detach().cpu().flatten().tolist()
-            if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-            if len(v) == 1:  return (int(v[0]), int(v[0]))
-            return fallback
-        try:
-            import numpy as np
-            if isinstance(val, np.ndarray):
-                v = val.flatten().tolist()
-                if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-                if len(v) == 1:  return (int(v[0]), int(v[0]))
-        except Exception:
-            pass
-        return fallback
-
-    out = {}
-    for k, v in feats.items():
-        if k not in want_keys:
-            continue
-        if k == "high_res_feats":
-            # 保持 pyramid list 形式
-            out[k] = [t.detach().to("cpu").contiguous().to(torch.float16) for t in v]
-            continue
-        # 其他鍵照舊
-        if isinstance(v, (list, tuple)) and len(v) > 0 and hasattr(v[0], "shape"):
-            v = v[0]
-        if isinstance(v, torch.Tensor):
-            out[k] = v.detach().to("cpu").contiguous().to(torch.float16)
-        else:
-            out[k] = v
-
-    # 尺寸鍵 → (H, W)
-    orig_hw = _as_hw_tuple(out.get("original_size")) or _as_hw_tuple(out.get("orig_size"))
-    inp_hw  = _as_hw_tuple(out.get("input_size"), fallback=orig_hw)
-    if orig_hw is not None:
-        out["original_size"] = tuple(orig_hw)
-        out["orig_size"]     = tuple(orig_hw)
-    if inp_hw is not None:
-        out["input_size"]    = tuple(inp_hw)
-    return out
-
-
 
 def _sam2_embed_from_cached(feats: dict) -> torch.Tensor:
     """
@@ -416,84 +357,6 @@ def _sam2_embed_from_cached(feats: dict) -> torch.Tensor:
     x = x.to(torch.float32)
     x = F.normalize(x, dim=0)
     return x  # [C,Hf,Wf]
-
-def _apply_cached_feats_to_predictor(predictor, feats_cached: dict, fallback_hw=None):
-    """
-    將快取回填到 predictor，並把所有尺寸欄位統一成 (H, W)。
-    同步覆蓋 predictor._features / predictor.features 與物件屬性。
-    """
-    def _as_hw_tuple(val, fallback=None):
-        import numpy as np
-        if val is None: return fallback
-        if isinstance(val, int): return (int(val), int(val))
-        if isinstance(val, (tuple, list)):
-            if len(val) >= 2: return (int(val[-2]), int(val[-1]))
-            if len(val) == 1:  return (int(val[0]), int(val[0]))
-            return fallback
-        if isinstance(val, torch.Tensor):
-            v = val.detach().cpu().flatten().tolist()
-            if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-            if len(v) == 1:  return (int(v[0]), int(v[0]))
-            return fallback
-        try:
-            import numpy as np
-            if isinstance(val, np.ndarray):
-                v = val.flatten().tolist()
-                if len(v) >= 2: return (int(v[-2]), int(v[-1]))
-                if len(v) == 1:  return (int(v[0]), int(v[0]))
-        except Exception:
-            pass
-        return fallback
-
-    dev = next(predictor.model.parameters()).device
-
-    # 1) 搬到正確裝置/精度
-    feats = {}
-    for k, v in feats_cached.items():
-        if isinstance(v, torch.Tensor):
-            feats[k] = v.to(dev).to(torch.float32)
-        else:
-            feats[k] = v
-
-    # 2) 尺寸一律 (H, W)
-    orig_hw = (_as_hw_tuple(feats_cached.get("original_size"))
-               or _as_hw_tuple(feats_cached.get("orig_size"))
-               or _as_hw_tuple(feats.get("original_size"))
-               or _as_hw_tuple(feats.get("orig_size"))
-               or _as_hw_tuple(fallback_hw))
-    inp_hw  = (_as_hw_tuple(feats_cached.get("input_size"))
-               or _as_hw_tuple(feats.get("input_size"))
-               or orig_hw)
-
-    if orig_hw is not None:
-        feats["original_size"] = tuple(orig_hw)
-        feats["orig_size"]     = tuple(orig_hw)
-    if inp_hw is not None:
-        feats["input_size"]    = tuple(inp_hw)
-
-    # 3) 回填 features 容器
-    predictor._features = feats
-    if hasattr(predictor, "features") and isinstance(getattr(predictor, "features"), dict):
-        predictor.features = feats
-
-    # 4) 同步屬性
-    def _safe_set(obj, name, val):
-        try: setattr(obj, name, tuple(val))
-        except Exception: pass
-    if orig_hw is not None:
-        for name in ("original_size", "orig_size", "_original_size", "_orig_hw"):
-            _safe_set(predictor, name, orig_hw)
-    if inp_hw is not None:
-        for name in ("input_size", "_input_size"):
-            _safe_set(predictor, name, inp_hw)
-
-    # 5) 標記為已 set image
-    if hasattr(predictor, "_is_image_set"):
-        predictor._is_image_set = True
-    else:
-        try: predictor.is_image_set = True
-        except Exception: pass
-
 
 def _patch_predictor_transforms(predictor):
     """
@@ -936,7 +799,7 @@ def support_mask_to_grid(mask_np: np.ndarray,
       - [gridH, gridW] 的 torch.float32 tensor（每格為前景佔比 0..1）
     """
     # 1) letterbox 到 cache_long
-    m_lb = resize_letterbox_mask(mask_np, fixed_size=cache_long)  # [H,W] uint8(0..255)
+    m_lb = resize_mask(mask_np, fixed_size=cache_long)  # [H,W] uint8(0..255)
     m_bin = (m_lb > 127).astype(np.float32)                       # [H,W] {0,1}
 
     # 2) 做一次整數平均池化 → 16x16 佔比
@@ -1014,7 +877,7 @@ class EpisodeDataset(Dataset):
         if os.path.exists(out):
             return
         rgb_raw = load_rgb(target)
-        rgb_lb, meta = resize_letterbox_rgb(rgb_raw, self.cache_long)
+        rgb_lb, meta = resize_rgb(rgb_raw, self.cache_long)
 
         # SAM2 predictor.set_image → 抽特徵字典
         with AutocastCtx(True):
@@ -1307,90 +1170,45 @@ def build_points_from_actions(a, P, Kfg, Kbg):
     回傳前景/背景點（只回 batch 單張 B=1 的 (r,c) 清單）
     """
     assert a.dim()==3 and a.shape[0]==1
-    A = a[0].detach().cpu().numpy()  # 32x32
-    Ppos = P[0,0].detach().cpu().numpy()
-    Pneg = P[0,2].detach().cpu().numpy()
-    pos_idx = np.argwhere(A==0)
-    neg_idx = np.argwhere(A==2)
-    if len(pos_idx)>0:
+    A = a[0].detach().cpu().numpy()      # [16,16]
+    Ppos = P[0,0].detach().cpu().numpy() # [16,16]
+    Pneg = P[0,2].detach().cpu().numpy() # [16,16]
+
+    Kfg = int(Kfg); Kbg = int(Kbg)
+
+    # 先從抽到的格子裡選 Top-K
+    pos_idx = np.argwhere(A == 0)
+    neg_idx = np.argwhere(A == 2)
+
+    if len(pos_idx) > 0 and Kfg > 0:
         scores = Ppos[pos_idx[:,0], pos_idx[:,1]]
-        order = (-scores).argsort()[:int(Kfg)]
+        order = (-scores).argsort()[:Kfg]
         pos_idx = pos_idx[order]
-    if len(neg_idx)>0:
-        scores = Pneg[neg_idx[:,0], neg_idx[:,1]]
-        order = (-scores).argsort()[:int(Kbg)]
-        neg_idx = neg_idx[order]
-    pts_fg = [(int(r),int(c)) for r,c in pos_idx]
-    pts_bg = [(int(r),int(c)) for r,c in neg_idx]
-    return pts_fg, pts_bg
-
-@torch.inference_mode()
-def sam2_reward_from_points_cached(pts_fg, pts_bg,
-                                   gridH, gridW,
-                                   tgt_rgb_raw, tgt_mask_raw,
-                                   predictor,
-                                   tgt_path: str,
-                                   cache_dir: str,
-                                   cache_long: int = 1024):
-    """
-    用 .pt/.npz 快取直接回填 predictor 特徵，避免 set_image。
-    """
-    pts = pts_fg + pts_bg
-    if len(pts) == 0:
-        return 0.0, None
-    labels = [1]*len(pts_fg) + [0]*len(pts_bg)
-
-    # 1) 用 letterbox 尺寸做座標換算 & 作為 fallback_hw
-    tgt_rgb_lb, _ = resize_letterbox_rgb(tgt_rgb_raw, cache_long)
-    H_img, W_img = tgt_rgb_lb.shape[:2]
-    xy = np.array([grid_to_xy((r, c), gridH, gridW, H_img, W_img) for (r, c) in pts], dtype=np.float32)
-
-    # 2) 從快取回填 predictor 狀態（優先 .pt，否則 .npz，最後才 fallback set_image）
-    key = cache_key(tgt_path)
-    pt_path  = os.path.join(cache_dir, f"{key}.pt")
-    npz_path = os.path.join(cache_dir, f"{key}.npz")
-
-    feats_cached = None
-    if os.path.isfile(pt_path):
-        data = torch.load(pt_path, map_location="cpu")
-        if "sam2" in data and isinstance(data["sam2"], dict):
-            feats_cached = data["sam2"]
-        elif "sam" in data:  # 舊式：只存 embedding
-            feats_cached = {"image_embeddings": data["sam"]}
-        else:
-            # 直接當作 feats 字典
-            feats_cached = data
-    elif os.path.isfile(npz_path):
-        data = np.load(npz_path)
-        if "sam" in data:
-            sam = torch.from_numpy(data["sam"]).to(torch.float16)  # [C,Hf,Wf]
-            feats_cached = {"image_embeddings": sam}
-        # 若也存了尺寸資訊，可一併補上
-    # 回填 or fallback
-    if feats_cached is not None:
-        predictor.set_image_from_cache(data["sam2"])
     else:
-        # 沒快取才真正編碼（訓練時不建議發生）
-        with AutocastCtx(True):
-            predictor.set_image(tgt_rgb_lb)
-    
-    _patch_predictor_transforms(predictor)
+        # Fallback：若沒抽到任何 pos，就直接用全域 Ppos Top-K
+        if Kfg > 0:
+            flat = np.argsort(Ppos.reshape(-1))[::-1][:Kfg]
+            rr, cc = np.unravel_index(flat, Ppos.shape)
+            pos_idx = np.stack([rr, cc], axis=1)
+        else:
+            pos_idx = np.empty((0,2), dtype=np.int64)
 
-    # 3) 解碼 → 取 best mask → 計 IoU
-    _force_size_attrs(predictor, (H_img, W_img))   # ★ 補齊所有尺寸欄位
-    
-    masks, scores, _ = predictor.predict(point_coords=xy.astype(np.float32),
-                                         point_labels=np.array(labels, dtype=np.int32),
-                                         multimask_output=True)
-    j = int(np.argmax(scores))
-    m = masks[j].astype(np.uint8)
+    if len(neg_idx) > 0 and Kbg > 0:
+        scores = Pneg[neg_idx[:,0], neg_idx[:,1]]
+        order = (-scores).argsort()[:Kbg]
+        neg_idx = neg_idx[order]
+    else:
+        # Fallback：若沒抽到任何 neg，就用全域 Pneg Top-K
+        if Kbg > 0:
+            flat = np.argsort(Pneg.reshape(-1))[::-1][:Kbg]
+            rr, cc = np.unravel_index(flat, Pneg.shape)
+            neg_idx = np.stack([rr, cc], axis=1)
+        else:
+            neg_idx = np.empty((0,2), dtype=np.int64)
 
-    gt_lb = resize_letterbox_mask(tgt_mask_raw, cache_long)
-    gt = (gt_lb > 127).astype(np.uint8)
-    inter = (m > 0) & (gt > 0)
-    uni   = (m > 0) | (gt > 0)
-    iou = float(inter.sum()) / float(uni.sum() + 1e-6)
-    return iou, {'xy': xy, 'labels': labels}
+    pts_fg = [(int(r), int(c)) for r, c in pos_idx]
+    pts_bg = [(int(r), int(c)) for r, c in neg_idx]
+    return pts_fg, pts_bg
 
 @torch.inference_mode()
 def sam2_reward_from_points_cached_batch(
@@ -1428,7 +1246,7 @@ def sam2_reward_from_points_cached_batch(
             continue
 
         # 用 letterbox 尺寸做網格→像素座標換算（不會觸發 encoder）
-        rgb_lb, _ = resize_letterbox_rgb(rgb_raw, cache_long)
+        rgb_lb, _ = resize_rgb(rgb_raw, cache_long)
         H_img, W_img = rgb_lb.shape[:2]
         xy = np.array(
             [grid_to_xy(rc, gridH, gridW, H_img, W_img) for rc in pts],
@@ -1461,7 +1279,7 @@ def sam2_reward_from_points_cached_batch(
         m = masks[j].astype(np.uint8)
 
         # 計 IoU（與 letterbox 後的 GT）
-        gt_lb = resize_letterbox_mask(mask_raw, cache_long)
+        gt_lb = resize_mask(mask_raw, cache_long)
         gt = (gt_lb > 127).astype(np.uint8)
 
         inter = (m > 0) & (gt > 0)
@@ -1497,7 +1315,7 @@ def sam2_reward_from_points_batched(
     coords_batch, labels_batch = [], []
     for b in range(B):
         rgb_raw = tgt_rgb_list[b]
-        rgb_lb, _ = resize_letterbox_rgb(rgb_raw, cache_long)
+        rgb_lb, _ = resize_rgb(rgb_raw, cache_long)
         H_img, W_img = rgb_lb.shape[:2]
         rgb_lb_list.append(rgb_lb)
 
@@ -1528,7 +1346,7 @@ def sam2_reward_from_points_batched(
     ious = []
     infos = []
     for b in range(B):
-        gt_lb = resize_letterbox_mask(tgt_mask_list[b], cache_long)
+        gt_lb = resize_mask(tgt_mask_list[b], cache_long)
         gt = (gt_lb > 127).astype(np.uint8)
 
         if coords_batch[b] is None:
@@ -1567,7 +1385,7 @@ def build_gt32_and_dist32(tgt_mask_list, cache_long: int, gridH: int, gridW: int
     gt_list, d_list = [], []
     for m in tgt_mask_list:
         # 1) letterbox 到 cache_long×cache_long
-        gt_lb = resize_letterbox_mask(m, cache_long)  # [H,W] uint8 (0..255)
+        gt_lb = resize_mask(m, cache_long)  # [H,W] uint8 (0..255)
 
         # 2) 前景二值 & 背景距離圖（px）
         gt_bin = (gt_lb > 127).astype(np.float32)            # [H,W] {0,1}
@@ -1800,7 +1618,11 @@ def train_loop(args):
                 # 只對「抽到的動作」取 log_prob（避免訊號被 32x32 平均稀釋）
                 logP_tau = F.log_softmax((G / tau).clamp(-50,50), dim=1)                  # [B,3,16,16]
                 logP_a   = logP_tau.gather(1, a_sample.unsqueeze(1)).squeeze(1)           # [B,16,16]
-                logp_samples.append(logP_a.mean(dim=(1,2)))                                # [B]
+                
+                # 僅計算 pos/neg 的 log-prob，避免訊號被 16×16 平均稀釋
+                mask = ((a_sample == 0) | (a_sample == 2)).float()                        # [B,16,16]
+                logp_sel = (logP_a * mask).sum(dim=(1,2)) / mask.sum(dim=(1,2)).clamp_min(1.0)
+                logp_samples.append(logp_sel)                                             # [B]                               # [B]
 
                 # 建點
                 pts_fg_s_list, pts_bg_s_list = build_pts_lists(a_sample, P_tau)
@@ -1982,14 +1804,6 @@ def evaluate(args, model, manifest_val_path=None, loader=None):
         return 0.0
 
 # ------------------------------ CSV utils -----------------------------
-def read_csv(path: str) -> List[Episode]:
-    out=[]
-    with open(path, 'r', newline='') as f:
-        r = csv.DictReader(f)
-        for row in r:
-            out.append(Episode(target=row['target'], target_mask=row['target_mask'],
-                               ref=row['ref'], ref_mask=row['ref_mask'], split=row.get('split','train')))
-    return out
 
 def build_cache_from_manifests(cache_dir, dinov3_id, sam2_cfg, sam2_ckpt,
                                manifest_paths, cache_long=1024, cache_multiple=16):
@@ -2006,97 +1820,6 @@ def build_cache_from_manifests(cache_dir, dinov3_id, sam2_cfg, sam2_ckpt,
     for p in tqdm(paths, desc=f"Caching images from manifests", unit="img"):
         ds._build_one(p)
     print(f"Cache built for {len(paths)} images → {cache_dir}")
-
-# ------------------------------ Inference demo ------------------------
-@torch.inference_mode()
-def run_infer(args):
-    tgt_rgb_raw = load_rgb(args.target)
-    tgt_mask_raw = load_gray(args.target_mask) if args.target_mask else None
-    ref_rgb_raw = load_rgb(args.ref); ref_mask_raw = load_gray(args.ref_mask)
-
-    predictor = sam2_build_image_predictor(args.sam2_cfg, args.sam2_ckpt)
-
-    # 優先從快取取特徵，缺檔再 fallback
-    try:
-        feats = compute_proto_and_sims_from_cache(
-            args.ref, ref_mask_raw, args.target, args.cache_dir, use_bg_proto=True
-        )
-    except Exception as e:
-        # 後備：即時編碼（僅 demo 使用）
-        tgt_rgb, _ = resize_letterbox_rgb(tgt_rgb_raw, args.cache_long)
-        ref_rgb, _ = resize_letterbox_rgb(ref_rgb_raw, args.cache_long)
-        with AutocastCtx(True):
-            predictor.set_image(ref_rgb)
-        sam_r_dict = _get_predictor_features_dict(predictor)
-        sam_r = _sam2_embed_from_cached(sam_r_dict)
-        with AutocastCtx(True):
-            predictor.set_image(tgt_rgb)
-        sam_t_dict = _get_predictor_features_dict(predictor)
-        sam_t = _sam2_embed_from_cached(sam_t_dict)
-        dn_r = get_grid_feats_dinov3_hf(ref_rgb, args.dinov3_model_id).permute(2,0,1)
-        dn_t = get_grid_feats_dinov3_hf(tgt_rgb, args.dinov3_model_id).permute(2,0,1)
-        # 簡化成與上面一致的計算（略）
-
-        raise RuntimeError("Inference fallback path not fully implemented for brevity; please build cache first.") from e
-
-    sam_t = feats['sam_feat_tgt'].unsqueeze(0)                  # [1,C,Hf,Wf]
-    dn_t  = feats['dino_feat_tgt'].permute(2,0,1)               # [Cd,Gh,Gw]
-    Hf,Wf = sam_t.shape[-2:]
-    sim_dn_up = F.interpolate(feats['sim_dino'].unsqueeze(0).unsqueeze(0), size=(Hf,Wf), mode='bicubic', align_corners=False).squeeze(0).squeeze(0)
-    # 生成 edge 需要 letterbox 後的 RGB
-    tgt_rgb_lb, _ = resize_letterbox_rgb(tgt_rgb_raw, args.cache_long)
-    edge = sobel_edge_hint(tgt_rgb_lb, (Hf,Wf))
-    x_in = torch.stack([feats['sim_sam'], sim_dn_up, edge], dim=0).unsqueeze(0).to(device)
-
-    # 模型
-    proj_dim=48; c_in = proj_dim*2 + 4
-    model = PointPromptNetB(c_in=c_in, kmax_f=args.kmax_f, kmax_b=args.kmax_b).to(device)
-    ckpt = torch.load(args.ckpt, map_location=device) if args.ckpt else None
-    if ckpt: model.load_state_dict(ckpt['model'], strict=False)
-    H_fg, H_bg, G = model(x_in.to(device), sam_t.to(device), dn_t.to(device),
-                          feats['proto_fg_sam'].unsqueeze(0), feats.get('proto_bg_sam', None).unsqueeze(0),
-                          feats['proto_fg_dn'].unsqueeze(0), feats.get('proto_bg_dn', None).unsqueeze(0))
-
-    # 用 grid 取點 → SAM2（用快取回填 predictor）
-    P = torch.softmax(G, dim=1)
-    Ppos, Pneg = P[:,0], P[:,2]
-    gridH=gridW=16
-    def topk_rc(P2d, K):
-        flat = P2d.view(-1)
-        k = min(K, flat.numel())
-        vals, idxs = torch.topk(flat, k=k)
-        rc = [(int(i//gridW), int(i%gridW)) for i in idxs]
-        return rc
-    pts_fg = topk_rc(Ppos[0], args.kmax_f)
-    pts_bg = topk_rc(Pneg[0], args.kmax_b)
-
-    tgt_rgb_lb, _ = resize_letterbox_rgb(tgt_rgb_raw, args.cache_long)
-    H_img, W_img = tgt_rgb_lb.shape[:2]
-    pts_xy = np.array([grid_to_xy(rc, gridH, gridW, H_img, W_img) for rc in (pts_fg+pts_bg)], dtype=np.float32)
-    labels = np.array([1]*len(pts_fg) + [0]*len(pts_bg), dtype=np.int32)
-
-    # 用 cache 回填 predictor
-    key = cache_key(args.target)
-    pt = os.path.join(args.cache_dir, f"{key}.pt")
-    if os.path.isfile(pt):
-        data = torch.load(pt, map_location="cpu")
-        predictor.set_image_from_cache(data["sam2"])
-    else:
-        with AutocastCtx(True):
-            predictor.set_image(tgt_rgb_lb)
-    
-    _patch_predictor_transforms(predictor)
-    
-    masks, scores, _ = predictor.predict(point_coords=pts_xy.astype(np.float32), point_labels=labels, multimask_output=True)
-    j = int(np.argmax(scores)); m = masks[j].astype(np.uint8)
-    overlay = tgt_rgb_lb.copy(); overlay[m>0] = (overlay[m>0]*0.5 + np.array([0,255,0])*0.5).astype(np.uint8)
-    for (x,y),lb in zip(pts_xy.astype(np.int32), labels):
-        color = (0,255,0) if lb==1 else (255,0,0)
-        cv2.circle(overlay, (int(x),int(y)), 5, color, -1)
-    os.makedirs(args.out_prefix, exist_ok=True)
-    cv2.imwrite(os.path.join(args.out_prefix, 'mask.png'), (m*255))
-    cv2.imwrite(os.path.join(args.out_prefix, 'overlay.png'), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    print('Saved →', os.path.join(args.out_prefix, 'overlay.png'))
 
 # ------------------------------ CLI -----------------------------------
 def parse_args():
@@ -2135,43 +1858,35 @@ def parse_args():
     p.add_argument('--hbg-band-dmin', type=int, default=32, help='>=0 to enable band gating; only distances in [dmin,dmax] keep bg targets')
     p.add_argument('--hbg-band-dmax', type=int, default=128, help='upper bound (px) for band gating')
     # RL 相關
-    p.add_argument('--lambda-pg-start', type=float, default=3.0)
-    p.add_argument('--lambda-pg-end',   type=float, default=1.0)
+    p.add_argument('--lambda-pg-start', type=float, default=0.6)
+    p.add_argument('--lambda-pg-end',   type=float, default=2.5)
 
-    p.add_argument('--entropy-beta-start', type=float, default=3e-3)
-    p.add_argument('--entropy-beta-end',   type=float, default=5e-4)
+    p.add_argument('--entropy-beta-start', type=float, default=0.02)
+    p.add_argument('--entropy-beta-end',   type=float, default=0)
 
-    p.add_argument('--tau-start', type=float, default=1.3)     # 溫度取樣：大→小
-    p.add_argument('--tau-end',   type=float, default=1.0)
+    p.add_argument('--tau-start', type=float, default=1.9)     # 溫度取樣：大→小
+    p.add_argument('--tau-end',   type=float, default=1.05)
 
-    p.add_argument('--w-heat-start', type=float, default=0.8)  # 像素監督：小幅讓位給 RL
+    p.add_argument('--w-heat-start', type=float, default=0.9)  # 像素監督：小幅讓位給 RL
     p.add_argument('--w-heat-end',   type=float, default=0.5)
 
-    p.add_argument('--iou-gamma', type=float, default=1.5)     # 獎勵非線性放大：R = IoU**gamma + bonus
+    p.add_argument('--iou-gamma', type=float, default=1.2)     # 獎勵非線性放大：R = IoU**gamma + bonus
     p.add_argument('--adv-norm', action='store_true', default=True)
-    p.add_argument('--adv-scale-start', type=float, default=5.0)
+    p.add_argument('--adv-scale-start', type=float, default=2.0)
     p.add_argument('--adv-scale-end',   type=float, default=1.0)
 
-    p.add_argument('--sample-n-start', type=int, default=1)    # 前期多抽樣平均 → 訊號更穩
+    p.add_argument('--sample-n-start', type=int, default=2)    # 前期多抽樣平均 → 訊號更穩
     p.add_argument('--sample-n-end',   type=int, default=1)
     
     p.add_argument('--neg-min-dist-px', type=int, default=32, help='penalize negative points whose distance-to-boundary < this (px at letterbox size); 0 disables')
-    p.add_argument('--neg-close-penalty', type=float, default=-0.5, help='penalty added per too-close negative point')
+    p.add_argument('--neg-close-penalty', type=float, default=-0.3, help='penalty added per too-close negative point')
     
     # 負點落在前景的懲罰
     p.add_argument('--neg-on-fg-penalty', type=float, default=-3,
                    help='penalty if a negative point lands on GT foreground (per-batch normalized)')
     p.add_argument('--neg-on-fg-thresh', type=float, default=0.75,
                    help='grid cell is considered FG if area fraction >= this threshold')
-    
-    # inference demo
-    p.add_argument('--infer', action='store_true')
-    p.add_argument('--target', type=str, default=None)
-    p.add_argument('--target-mask', type=str, default=None)
-    p.add_argument('--ref', type=str, default=None)
-    p.add_argument('--ref-mask', type=str, default=None)
-    p.add_argument('--ckpt', type=str, default=None)
-    p.add_argument('--out-prefix', type=str, default='outputs/demo')
+
     # manifest
     p.add_argument('--manifest-train', type=str, default=None)
     p.add_argument('--manifest-val', type=str, default=None)
@@ -2185,9 +1900,7 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    if args.infer:
-        run_infer(args)
-    elif args.train or args.build_cache:
+    if args.train or args.build_cache:
         if args.build_cache and args.cache_scan_dirs:
             ds = EpisodeDataset([], args.cache_dir, args.dinov3_model_id,
                                 args.sam2_cfg, args.sam2_ckpt,
@@ -2209,11 +1922,7 @@ if __name__ == '__main__':
             mlist = [p for p in [args.manifest_train, args.manifest_val] if p]
             build_cache_from_manifests(args.cache_dir, args.dinov3_model_id, args.sam2_cfg, args.sam2_ckpt,
                                         mlist, cache_long=args.cache_long, cache_multiple=args.cache_multiple)
-        elif args.build_cache and not args.train:
-            episodes = read_csv(args.csv)
-            _ = EpisodeDataset(episodes, args.cache_dir, args.dinov3_model_id, args.sam2_ckpt,
-                                args.sam2_ckpt, build_cache=True,
-                                cache_long=args.cache_long, cache_multiple=args.cache_multiple)
+        
         else:
             train_loop(args)
     else:

@@ -172,6 +172,69 @@ class SAM2ImagePredictor:
         self._is_batch = True
         logging.info("Image embeddings computed.")
 
+    def predict_batch_logits_torch(
+            self,
+            point_coords_batch: List[np.ndarray] = None,
+            point_labels_batch: List[np.ndarray] = None,
+            box_batch: List[np.ndarray] = None,
+            mask_input_batch: List[np.ndarray] = None,
+            multimask_output: bool = True,
+            return_logits: bool = False,
+            normalize_coords=True,
+        ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+            """This function is very similar to predict(...), however it is used for batched mode, when the model is expected to generate predictions on multiple images.
+            It returns a tuple of lists of masks, ious, and low_res_masks_logits.
+            """
+            assert self._is_batch, "This function should only be used when in batched mode"
+            if not self._is_image_set:
+                raise RuntimeError(
+                    "An image must be set with .set_image_batch(...) before mask prediction."
+                )
+            num_images = len(self._features["image_embed"])
+            all_masks = []
+            all_ious = []
+            all_low_res_masks = []
+            for img_idx in range(num_images):
+                # Transform input prompts
+                point_coords = (
+                    point_coords_batch[img_idx] if point_coords_batch is not None else None
+                )
+                point_labels = (
+                    point_labels_batch[img_idx] if point_labels_batch is not None else None
+                )
+                box = box_batch[img_idx] if box_batch is not None else None
+                mask_input = (
+                    mask_input_batch[img_idx] if mask_input_batch is not None else None
+                )
+                mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
+                    point_coords,
+                    point_labels,
+                    box,
+                    mask_input,
+                    normalize_coords,
+                    img_idx=img_idx,
+                )
+                masks, iou_predictions, low_res_masks = self._predict(
+                    unnorm_coords,
+                    labels,
+                    unnorm_box,
+                    mask_input,
+                    multimask_output,
+                    return_logits=return_logits,
+                    img_idx=img_idx,
+                )
+                masks_np = masks.squeeze(0).float()
+                iou_predictions_np = (
+                    iou_predictions.squeeze(0).float()
+                )
+                low_res_masks_np = low_res_masks.squeeze(0).float()
+                
+                all_masks.append(masks_np)
+                all_ious.append(iou_predictions_np)
+                all_low_res_masks.append(low_res_masks_np)
+    
+            return all_masks, all_ious, all_low_res_masks
+
     def predict_batch(
         self,
         point_coords_batch: List[np.ndarray] = None,
@@ -233,6 +296,35 @@ class SAM2ImagePredictor:
             all_low_res_masks.append(low_res_masks_np)
 
         return all_masks, all_ious, all_low_res_masks
+    
+    def predict_logits_torch(
+        self,
+        point_coords: Optional[torch.Tensor] = None,   # 允許 torch tensor
+        point_labels: Optional[torch.Tensor] = None,
+        box: Optional[torch.Tensor] = None,
+        mask_input: Optional[torch.Tensor] = None,
+        multimask_output: bool = False,
+        normalize_coords: bool = True,
+        img_idx: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        與 predict 相同，但回傳 torch.Tensor（不 detach、不轉 numpy）。
+        回傳：masks, ious, low_res_masks（皆為 torch，B=1）
+        """
+        # 轉/整理座標到模型內部座標系（沿用現有 _prep_prompts）
+        mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
+            point_coords, point_labels, box, mask_input, normalize_coords, img_idx=img_idx
+        )
+        masks, iou_predictions, low_res_masks = self._predict(
+            unnorm_coords,
+            labels,
+            unnorm_box,
+            mask_input,
+            multimask_output,
+            return_logits=True,   # 要 logits
+            img_idx=img_idx,
+        )
+        return masks, iou_predictions, low_res_masks  # 注意：保持 tensor，別 .detach() / .numpy()
 
     def predict(
         self,
@@ -333,7 +425,7 @@ class SAM2ImagePredictor:
                 mask_input = mask_input[None, :, :, :]
         return mask_input, unnorm_coords, labels, unnorm_box
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def _predict(
         self,
         point_coords: Optional[torch.Tensor],
@@ -582,4 +674,70 @@ class SAM2ImagePredictor:
             "levels": len(pack["high_res_feats"]),
         }
         return pack
+    
+    @torch.no_grad()
+    def set_image_batch_from_cache(self, cache_list: list[dict]) -> None:
+        """
+        批量從快取資料載入 features，跳過影像 encoder。
+        cache_list 內每個元素結構需與 set_image_from_cache(cache) 相同：
+          - "image_embed": Tensor [C,Hf,Wf] 或 [1,C,Hf,Wf]
+          - "high_res_feats": List[Tensor]，各層 [C,Hl,Wl] 或 [1,C,Hl,Wl]
+          - "original_size"/"orig_size": (H,W)
+        """
+        self.reset_predictor()
+        dev = self.device
+        image_embeds = []
+        high_res_pyr = None
+        self._orig_hw = []
+    
+        def to_dev_fp32(x):
+            return (x if isinstance(x, torch.Tensor) else torch.as_tensor(x)).to(dev).to(torch.float32)
+    
+        for cache in cache_list:
+            # --- image embed ---
+            img_key = None
+            for k in ("image_embed", "image_embeddings", "image_features", "vision_feats"):
+                if k in cache:
+                    img_key = k; break
+            assert img_key is not None, "cache missing image embedding"
+    
+            emb = cache[img_key]
+            if isinstance(emb, list):
+                emb = emb[0]
+            emb = to_dev_fp32(emb)
+            if emb.dim() == 3:  # [C,Hf,Wf] -> [1,C,Hf,Wf]
+                emb = emb.unsqueeze(0)
+            assert emb.dim() == 4 and emb.size(0) == 1
+            image_embeds.append(emb)  # 暫時 [1,C,Hf,Wf]
+    
+            # --- high res pyramid ---
+            hrs = cache.get("high_res_feats", None)
+            assert isinstance(hrs, (list, tuple)) and len(hrs) > 0, "cache missing 'high_res_feats'"
+            hrs = [to_dev_fp32(t) for t in hrs]
+            for i in range(len(hrs)):
+                if hrs[i].dim() == 3:
+                    hrs[i] = hrs[i].unsqueeze(0)  # [1,C,H,W]
+            if high_res_pyr is None:
+                high_res_pyr = [[h] for h in hrs]  # list(level) of list(batch_items)
+            else:
+                for i in range(len(hrs)):
+                    high_res_pyr[i].append(hrs[i])
+    
+            # --- original size ---
+            ohw = (cache.get("original_size") or cache.get("orig_size"))
+            if isinstance(ohw, torch.Tensor):
+                ohw = tuple(int(v) for v in ohw.flatten().tolist()[:2])
+            elif isinstance(ohw, (list, tuple)):
+                ohw = (int(ohw[0]), int(ohw[1]))
+            else:
+                s = int(getattr(self.model, "image_size", 1024)); ohw = (s, s)
+            self._orig_hw.append(ohw)
+    
+        # 堆成 batch
+        image_embed_b = torch.cat(image_embeds, dim=0)  # [B,C,Hf,Wf]
+        high_res_feats_b = [torch.cat(level_list, dim=0) for level_list in high_res_pyr]  # 每層 [B,C,H,W]
+    
+        self._features = {"image_embed": image_embed_b, "high_res_feats": high_res_feats_b}
+        self._is_image_set = True
+        self._is_batch = True
     
