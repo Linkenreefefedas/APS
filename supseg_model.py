@@ -197,15 +197,17 @@ class CrossAttentionFuse(nn.Module):
 class GridHead(nn.Module):
     def __init__(self, in_ch: int, num_classes: int = 3):
         super().__init__()
+        self.down = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1, bias=False)  # 32->16
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(in_ch, in_ch//2, 3, padding=1), nn.ReLU(inplace=True)
         )
         self.cls = nn.Conv2d(in_ch//2, num_classes, 1)
+
     def forward(self, x32: torch.Tensor) -> torch.Tensor:
-        x = F.avg_pool2d(x32, kernel_size=2, stride=2)   # 32 -> 16
+        x = self.down(x32)     # 替代 avg_pool2d
         x = self.block(x)
-        return self.cls(x)                                # [B,3,16,16]
+        return self.cls(x)
 
 # -------------------------- SAM2 wrappers --------------------------
 class Sam2TorchWrapper(nn.Module):
@@ -291,8 +293,8 @@ class SupSegGridSAM2(nn.Module):
         self.lambda_dice = float(lambda_dice)
         self.sam2_torch = sam2_torch
         self.sam2_pred = sam2_pred
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20), requires_grad=False)
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00),  requires_grad=False)
+        self.register_buffer("pseudo_temp", torch.tensor(0.20))
+        self.register_buffer("pseudo_bias", torch.tensor(0.00))
         
 
         # SAM 64->32
@@ -366,14 +368,15 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                     k_pos: int = 1, k_neg: int = 1, tau: float = 1.0,
                     lambda_ce: float = 1.0, lambda_dice: float = 1.0,
                     sam2_torch: Optional[Sam2TorchWrapper] = None, sam2_pred=None,
-                    use_coord: bool = True, e_channels: int = 2, pe_freqs: int = 16):
+                    use_coord: bool = True, e_channels: int = 2, pe_freqs: int = 16, lambda_aux: float = 0.3):
         super().__init__(proj_dim, pos_th, neg_th, k_pos, k_neg, tau,
                             lambda_ce, lambda_dice, sam2_torch, sam2_pred)
         self.use_coord = bool(use_coord)
         self.e_channels = int(e_channels)
+        self.lambda_aux = float(lambda_aux)  # auxiliary mask loss weight
 
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20))  # 初始保持原本 0.2
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00))
+        self.register_buffer("pseudo_temp", torch.tensor(0.20))
+        self.register_buffer("pseudo_bias", torch.tensor(0.00))
 
         # 重新設定 share_proj 的輸入通道（原: 256 + 768 + 256 + 1）
         base_in = 256 + 768 + 256 + 1
@@ -403,6 +406,17 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             nn.Conv2d(proj_dim // 4, 2, 1),
             nn.Sigmoid()  # 兩路權重 ∈ (0,1)
         )
+
+        # 輕量 mask head（預設輸出 1 通道 logits）
+        self.aux_mask_head = nn.Sequential(
+            nn.Conv2d(proj_dim, proj_dim//2, 3, padding=1, bias=False),
+            nn.GroupNorm(32, proj_dim//2),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 32→64
+            nn.Conv2d(proj_dim//2, 1, 1)  # logits at 64×64
+        )
+        
+        self.aux_mask_weight = 0.3  # 初期 0.2~0.3，之後可調
 
         # grid head 可沿用；若想更在地，可換成擴張卷積/多層
         # self.grid_head = GridHead(proj_dim, num_classes=3)
@@ -473,8 +487,10 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         wa = g[:, 0:1]; wl = g[:, 1:2]
         x_fused = wa * x_attn + wl * x_local
 
-        # 進 grid head（16x16 三分類）
-        return self.grid_head(x_fused)
+        # 進 grid head（16x16 三分類）+ 輕量 aux mask（32x32 前景）
+        grid_logits     = self.grid_head(x_fused)            # [B,3,16,16]
+        aux_mask_logits = self.aux_mask_head(x_fused)        # [B,1,32,32]
+        return grid_logits, aux_mask_logits
 
     # def points_from_grid(self, grid_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     #     """
@@ -577,15 +593,19 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         import torch.nn.functional as F
     
         B, C, H, W = grid_logits.shape  # H=W=16
-        P = F.softmax(grid_logits, dim=1)
+        # 對 pos/neg 做溫度縮放，neutral 不動；τ<1 時會讓峰更尖
+        tau32 = float(getattr(self, "tau", 1.0))
+        logits = grid_logits.clone()
+        logits[:, 0:2] = logits[:, 0:2] / max(1e-6, tau32)
+        P = F.softmax(logits, dim=1)
         pos_map = P[:, 0:1]  # [B,1,H,W]
         neg_map = P[:, 1:2]
     
         # 可調參數（不在屬性時給預設）
         cand_factor = getattr(self, "cand_factor", 5)      # 候選放大倍數
         min_dist    = float(getattr(self, "nms_min_dist", 2.0))  # 格為單位的最小距離
-        th_pos      = getattr(self, "peak_th_pos", None)   # 0~1；None=不設門檻
-        th_neg      = getattr(self, "peak_th_neg", None)
+        th_pos      = getattr(self, "peak_th_pos", 0.5)   # 0~1；None=不設門檻
+        th_neg      = getattr(self, "peak_th_neg", 0.6)
         r           = getattr(self, "refine_r", 1)         # 精修半徑: 1→3x3, 2→5x5
         tau         = float(getattr(self, "tau", 1.0))
     
@@ -730,8 +750,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         gamma: float = 2.0,           # 焦點參數，越大越聚焦困難樣本
         alpha_pos: float = 3.0,       # 正類權重（> neg）
         alpha_neg: float = 1.0,       # 負類權重
-        ignore_index: int = 2,        # 忽略 neutral
-        normalize_by_weight: bool = True,  # 用加權樣本數作分母，穩定尺度
+        alpha_neu: float = 0.25, normalize_by_weight: bool = True
     ):
         assert logits.dim() == 4 and logits.size(1) == 3, f"logits 應為 [B,3,H,W]，got {tuple(logits.shape)}"
         if targets.dim() == 4 and targets.size(1) == 1:
@@ -749,19 +768,18 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         pt = logp_t.exp()
     
         # --- 類別 α 權重（broadcast 到 [B,H,W]）---
-        alpha = logits.new_tensor([alpha_pos, alpha_neg, 0.0])  # [3] same device/dtype
+        alpha = logits.new_tensor([alpha_pos, alpha_neg, alpha_neu])  # [3] same device/dtype
         alpha_t = alpha[y]                                      # [B,H,W]  ← 這行取代 gather
     
         # --- Focal ---
         loss_pix = -(alpha_t * (1.0 - pt).pow(gamma) * logp_t)  # [B,H,W]
-    
-        # --- 忽略 neutral 並平均 ---
-        valid = (y != ignore_index).float()
-        loss_pix = loss_pix * valid
+
+        # 不再忽略 neutral，用加權樣本數做歸一化
         if normalize_by_weight:
-            denom = (alpha_t * valid).sum().clamp_min(1.0)      # 加權有效樣本數
+            denom = (alpha_t).sum().clamp_min(1.0)
         else:
-            denom = valid.sum().clamp_min(1.0)
+            denom = torch.tensor(float(y.numel()), device=logits.device)
+        
         return loss_pix.sum() / denom
     
     def forward(self,
@@ -778,10 +796,15 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         """
         Returns dict with: grid_logits, ce_loss, dice_loss (0 if unavailable), total_loss, (optional) pred_mask_logits
         """
-        grid_logits = self.forward_grid(
+        grid_logits, aux_mask_logits = self.forward_grid(
             sam_tgt_64, dino_tgt_32, proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn, extra_maps32
         )
-        out = {"grid_logits": grid_logits}
+        out = {
+            "grid_logits": grid_logits,
+            "loss_ce": grid_logits.new_tensor(0.0),
+            "loss_dice": grid_logits.new_tensor(0.0),
+            "loss_aux_dice": grid_logits.new_tensor(0.0)
+        }
         if tgt_gt_mask_512 is not None:
             y = make_grid_labels(tgt_gt_mask_512, self.pos_th, self.neg_th)
             #ce = F.cross_entropy(grid_logits, y)
@@ -790,7 +813,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                 gamma=2.0,      # 常用 1.5~2.5
                 alpha_pos=3.0,  # 正類較重
                 alpha_neg=1.0,  # 負類較輕
-                ignore_index=2,
+                alpha_neu=0.2,  # neutral 類輕（但非 0）
             )
             
             out["loss_ce"] = ce
@@ -799,12 +822,14 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             out["loss_ce"] = ce
 
         dice = grid_logits.new_tensor(0.0)
+        out["loss_dice"] = dice
+
         pred_mask_logits = None
         B = grid_logits.size(0)
         if (tgt_gt_mask_512 is not None):
             # 取得點
             pts, lbl = self.points_from_grid(grid_logits)  # [B,K,2], [B,K]
-        
+            
             if self.sam2_pred is not None:
                 # sam2_image_predictor 已經在外部 set_image_batch_from_cache(...) 好這一個 batch
                 # 準備 list[tensor]，每張一個 (保持 torch，不 numpy)
@@ -818,7 +843,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                     mask_input_batch=None,
                     multimask_output=False,
                     return_logits=True,
-                    normalize_coords=True,
+                    normalize_coords=False,
                 )
                 # lowres_list: List[Tensor [1,1,h,w] 或 [1,h,w]]
                 # 統一成 [B,1,h,w]
@@ -842,8 +867,19 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         
         if pred_mask_logits is not None:
             out["pred_mask_logits"] = pred_mask_logits
+
         out["loss_dice"] = dice
 
-        total = self.lambda_ce*ce + self.lambda_dice*dice
+        # === Aux mask dice ===
+        out["loss_aux_dice"] = grid_logits.new_tensor(0.0)   # 先初始化，確保不是 None
+        if tgt_gt_mask_512 is not None:
+            aux_dice = dice_loss_from_logits(
+                F.interpolate(aux_mask_logits, size=(256,256), mode="bilinear", align_corners=False),
+                F.interpolate(tgt_gt_mask_512.float(), size=(256,256), mode="nearest")
+            )
+            out["loss_aux_dice"] = aux_dice
+        
+        # === Total ===
+        total = self.lambda_ce * ce + self.lambda_dice * dice + self.aux_mask_weight * out["loss_aux_dice"]
         out["loss"] = total
         return out

@@ -6,13 +6,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import cv2
+import math
 
 # import base episodic builders from your project
 from dataloader_ps import build_psv2_index as build_coco20i_index
 from dataloader_ps import OneShotPSV2Random as OneShotCOCO20iRandom
 
 # from our modules above
-from supseg_model import Sam2TorchWrapper,SupSegGridSAM2Spatial
+from supseg_model import Sam2TorchWrapper,SupSegGridSAM2Spatial#,CrossAttentionFuseWin2
 from supseg_dataset import SupEpisodeAdapter
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
@@ -60,7 +61,7 @@ def infer_sam2_masks_cached(points_xy, labels, tgt_rgb_list, tgt_mask_list, tgt_
         data = torch.load(pt_path, map_location="cpu")
         predictor.set_image_from_cache(data["sam2"])  # no encoder
         _patch_predictor_transforms(predictor)
-        masks, scores, _ = predictor.predict(point_coords=xy, point_labels=lbl.astype(np.int32), multimask_output=True)
+        masks, scores, _ = predictor.predict(point_coords=xy, point_labels=lbl.astype(np.int32), multimask_output=True, normalize_coords=False)
         j = int(np.argmax(scores)); m = masks[j].astype(np.uint8)
         gt_lb = resize_mask(tgt_mask_list[b], cache_long)
         gt = (gt_lb>127).astype(np.uint8)
@@ -85,10 +86,11 @@ def parse_args():
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--lr', type=float, default=5e-3)
-    p.add_argument('--pos-th', type=float, default=0.7)
-    p.add_argument('--neg-th', type=float, default=0.1)
+    p.add_argument('--pos-th', type=float, default=0.75)
+    p.add_argument('--neg-th', type=float, default=0.25)
     p.add_argument('--lambda-ce', type=float, default=0.5)
     p.add_argument('--lambda-dice', type=float, default=1.0)
+    p.add_argument('--lambda-aux', type=float, default=0.3)
     p.add_argument('--sam2-diff', action='store_true', help='use differentiable SAM2 path (prompt->mask)')
     p.add_argument('--eval-every', type=int, default=1)
     p.add_argument('--val-samples', type=int, default=200)
@@ -96,6 +98,10 @@ def parse_args():
     p.add_argument('--out-dir', type=str, default='outputs_sup')
     p.add_argument('--k_pos', type=int, default=10)
     p.add_argument('--k_neg', type=int, default=8)
+    p.add_argument('--tau-start', type=float, default=1.2)
+    p.add_argument('--tau-end',   type=float, default=0.8)
+    p.add_argument('--pseudo-temp-start', type=float, default=0.6)
+    p.add_argument('--pseudo-temp-end',   type=float, default=0.3)
     p.add_argument('--resume', type=str, default=None)
     return p.parse_args()
 
@@ -150,8 +156,12 @@ def main():
         pos_th=args.pos_th, neg_th=args.neg_th,
         lambda_ce=args.lambda_ce, lambda_dice=args.lambda_dice,
         sam2_torch=sam2_torch, k_pos=args.k_pos, k_neg=args.k_neg, sam2_pred=predictor,
-        use_coord=True, e_channels=0, pe_freqs=16
+        use_coord=True, e_channels=0, pe_freqs=16,lambda_aux=args.lambda_aux
     ).to(device)
+
+    model.tau = float(args.tau_start)
+    with torch.no_grad():
+        model.pseudo_temp.copy_(torch.tensor(args.pseudo_temp_start, device=device))
     
     # # 直接把單層 fuse 換成「雙層 Window Fuse」
     # model.fuse = CrossAttentionFuseWin2(
@@ -185,7 +195,34 @@ def main():
             print(f"[resume] from {args.resume} → epoch {start_epoch},  best_iou {best_iou:.4f}")
 
     for epoch in range(start_epoch, args.epochs):
-        model.train(); t0=time.time(); losses=[];dice_loss=[];ce_loss=[]
+        model.train(); t0=time.time(); losses=[];dice_loss=[];ce_loss=[];aux_loss=[]
+
+        # ---- 退火排程（放在每個 epoch 的一開始；確保跑完最後一個 epoch 時到達 end 值）----
+        T = max(1, args.epochs - start_epoch)
+        # 用 (epoch + 1) 讓最後一輪到 1.0
+        prog = min(1.0, (epoch + 1 - start_epoch) / T)
+        
+        # τ 線性：tau_start -> tau_end
+        model.tau = args.tau_start + (args.tau_end - args.tau_start) * prog
+        
+        # pseudo_temp 餘弦：start -> end
+        # 建議：start=0.6, end=0.35（先穩，再慢慢銳化）
+        cos_w = 0.5 * (1.0 + math.cos(math.pi * (1.0 - prog)))  # 0->1 時，cos_w: 0->1（方便閱讀）
+        pseudo_t = args.pseudo_temp_start * (1 - cos_w) + args.pseudo_temp_end * cos_w
+        
+        with torch.no_grad():
+            # 若 pseudo_temp 是 buffer（推薦做法），這行照樣可用
+            model.pseudo_temp.copy_(torch.tensor(float(pseudo_t), device=device))
+        
+        # 輕量 head/主 Dice 的暖啟排程
+        # 前 3 個 epoch 降低 Dice / aux 的權重，減少和 CE 的衝突
+        if epoch < start_epoch + 3:
+            model.lambda_dice = getattr(args, "lambda_dice_warm", 0.2)
+            model.aux_mask_weight = getattr(args, "aux_mask_weight_warm", 0.2)
+        else:
+            model.lambda_dice = args.lambda_dice
+            model.aux_mask_weight = args.aux_mask_weight
+        
 
         for batch in tqdm(dl_tr, desc=f'Epoch {epoch}', unit='batch'):
             # === 批量把這個 batch 的 SAM2 特徵灌進 predictor ===
@@ -233,6 +270,7 @@ def main():
             loss = out['loss']
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            opt.step()
             sch.step()
 
             # for name, p in model.named_parameters():
@@ -240,12 +278,12 @@ def main():
             #         print(name, p.grad.abs().mean().item())
 
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-            opt.step()
             losses.append(float(loss.item()))
             dice_loss.append(float(out['loss_dice'].item()))
             ce_loss.append(float(out['loss_ce'].item()))
+            aux_loss.append(float(out['loss_aux_dice'].item()))
           
-        print(f"[epoch {epoch}] train loss {np.mean(losses):.4f}  dice {np.mean(dice_loss):.4f}  ce {np.mean(ce_loss):.4f}  time {time.time()-t0:.1f}s")
+        print(f"[epoch {epoch}] train loss {np.mean(losses):.4f}  dice {np.mean(dice_loss):.4f}  ce {np.mean(ce_loss):.4f} aux {np.mean(aux_loss):.4f} time {time.time()-t0:.1f}s")
         if (epoch+1) % args.save_every == 0:
             os.makedirs(args.out_dir, exist_ok=True)
             save_checkpoint(os.path.join(args.out_dir, f"ppnet_epoch{epoch}.pt"),
