@@ -12,7 +12,7 @@ from dataloader_ps import build_psv2_index as build_coco20i_index
 from dataloader_ps import OneShotPSV2Random as OneShotCOCO20iRandom
 
 # from our modules above
-from supseg_model import SupSegGridSAM2, Sam2TorchWrapper, make_grid_labels
+from supseg_model import Sam2TorchWrapper,SupSegGridSAM2Spatial,CrossAttentionFuseWin2
 from supseg_dataset import SupEpisodeAdapter
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
@@ -136,9 +136,32 @@ def main():
     predictor = sam2_build_image_predictor(args.sam2_cfg, args.sam2_ckpt)
 
 
-    model = SupSegGridSAM2(proj_dim=256, pos_th=args.pos_th, neg_th=args.neg_th,
-                           lambda_ce=args.lambda_ce, lambda_dice=args.lambda_dice,
-                           sam2_torch=sam2_torch,k_pos=args.k_pos, k_neg=args.k_neg, sam2_pred=predictor).to(device)
+    # model = SupSegGridSAM2(proj_dim=256, pos_th=args.pos_th, neg_th=args.neg_th,
+    #                        lambda_ce=args.lambda_ce, lambda_dice=args.lambda_dice,
+    #                        sam2_torch=sam2_torch,k_pos=args.k_pos, k_neg=args.k_neg, sam2_pred=predictor).to(device)
+
+    # model = SupSegGridSAM2Spatial(proj_dim=256, pos_th=args.pos_th, neg_th=args.neg_th,
+    #                            lambda_ce=args.lambda_ce, lambda_dice=args.lambda_dice,
+    #                            sam2_torch=sam2_torch,k_pos=args.k_pos, k_neg=args.k_neg, sam2_pred=predictor,
+    #                            use_coord=True, e_channels=0,  pe_freqs=16).to(device)
+
+    model = SupSegGridSAM2Spatial(
+        proj_dim=256,
+        pos_th=args.pos_th, neg_th=args.neg_th,
+        lambda_ce=args.lambda_ce, lambda_dice=args.lambda_dice,
+        sam2_torch=sam2_torch, k_pos=args.k_pos, k_neg=args.k_neg, sam2_pred=predictor,
+        use_coord=True, e_channels=0, pe_freqs=16
+    ).to(device)
+    
+    # 直接把單層 fuse 換成「雙層 Window Fuse」
+    model.fuse = CrossAttentionFuseWin2(
+        dim=256,           # 要和 proj_dim 一致
+        heads=8,           # 和原本一致
+        window_size=8,     # 32×32 特徵 → 8 最剛好（切 4×4 個窗）
+        use_abspe=False,   # 先關；若想再加絕對PE再開 True
+        pe_freqs=16
+    ).to(device)
+    
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     total_steps = args.epochs * max(1, len(dl_tr))
@@ -162,7 +185,7 @@ def main():
             print(f"[resume] from {args.resume} → epoch {start_epoch},  best_iou {best_iou:.4f}")
 
     for epoch in range(start_epoch, args.epochs):
-        model.train(); t0=time.time(); losses=[]
+        model.train(); t0=time.time(); losses=[];dice_loss=[];ce_loss=[]
 
         for batch in tqdm(dl_tr, desc=f'Epoch {epoch}', unit='batch'):
             # === 批量把這個 batch 的 SAM2 特徵灌進 predictor ===
@@ -219,9 +242,10 @@ def main():
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             opt.step()
             losses.append(float(loss.item()))
+            dice_loss.append(float(out['loss_dice'].item()))
+            ce_loss.append(float(out['loss_ce'].item()))
           
-
-        print(f"[epoch {epoch}] train loss {np.mean(losses):.4f}  time {time.time()-t0:.1f}s")
+        print(f"[epoch {epoch}] train loss {np.mean(losses):.4f}  dice {np.mean(dice_loss):.4f}  ce {np.mean(ce_loss):.4f}  time {time.time()-t0:.1f}s")
         if (epoch+1) % args.save_every == 0:
             os.makedirs(args.out_dir, exist_ok=True)
             save_checkpoint(os.path.join(args.out_dir, f"ppnet_epoch{epoch}.pt"),

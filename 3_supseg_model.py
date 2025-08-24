@@ -105,94 +105,354 @@ class ConvPosBias(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.dw(x)
     
-class HierProj(nn.Module):
-    """
-    階層式融合：
-    (SAM, DINO) → mid1 → (+proto) → mid2 → (+pseudo, coord, extra) → proj_dim
-    """
-    def __init__(self, proj_dim: int, e_channels: int = 0, use_coord: bool = True):
-        super().__init__()
-        self.use_coord = use_coord
-        self.e_channels = e_channels
-        d_mid = proj_dim          # 中間節點通道
-        d_small = max(32, proj_dim // 4)
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    """x: [B,C,H,W] -> [B*nW, C, w, w]"""
+    B, C, H, W = x.shape
+    w = window_size
+    assert H % w == 0 and W % w == 0, f"H/W 必須能被 {w} 整除"
+    x = x.view(B, C, H // w, w, W // w, w)                # [B,C,nH,w,nW,w]
+    x = x.permute(0, 2, 4, 1, 3, 5).contiguous()          # [B,nH,nW,C,w,w]
+    return x.view(-1, C, w, w)                            # [B*nW,C,w,w]
 
-        # stage 1: 影像 backbone 融合
-        self.s1 = nn.Sequential(
-            nn.Conv2d(256+768, d_mid, 1, bias=False),
-            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
-        )
-        # stage 2: 加入 proto
-        self.s2 = nn.Sequential(
-            nn.Conv2d(d_mid+512, d_mid, 1, bias=False),  # ← 接收 FG(256)+BG(256)
-            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
-        )
-        
-        # 將小提示壓小再融合
-        self.pseudo_proj = nn.Conv2d(1, d_small, 1, bias=False)
-        self.coord_proj  = nn.Conv2d(2, d_small, 1, bias=False) if use_coord else None
-        self.extra_proj  = nn.Conv2d(e_channels, d_small, 1, bias=False) if e_channels>0 else None
 
-        # stage 3: 最終融合到 proj_dim
-        in_s3 = d_mid + d_small  # pseudo
-        if use_coord:   in_s3 += d_small
-        if e_channels>0:in_s3 += d_small
+def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
+    """windows: [B*nW, C, w, w] -> [B,C,H,W]"""
+    w = window_size
+    nH, nW = H // w, W // w
+    B = windows.shape[0] // (nH * nW)
+    x = windows.view(B, nH, nW, -1, w, w)                 # [B,nH,nW,C,w,w]
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous()          # [B,C,nH,w,nW,w]
+    return x.view(B, -1, H, W)
 
-        self.s3 = nn.Sequential(
-            nn.Conv2d(in_s3, proj_dim, 1, bias=False),
-            nn.BatchNorm2d(proj_dim), nn.ReLU(inplace=True)
-        )
 
-    def forward(self, sam32, dn32, proto_broad, pseudo, coord=None, extra=None):
-        x = self.s1(torch.cat([sam32, dn32], dim=1))
-        x = self.s2(torch.cat([x, proto_broad], dim=1))
-
-        tips = [self.pseudo_proj(pseudo)]
-        if self.use_coord and coord is not None:
-            tips.append(self.coord_proj(coord))
-        if self.e_channels>0 and extra is not None:
-            tips.append(self.extra_proj(extra))
-
-        x = self.s3(torch.cat([x] + tips, dim=1))
-        return x
-    
+# ---- Replace original CrossAttentionFuse with this version ----
 class CrossAttentionFuse(nn.Module):
-    def __init__(self, dim: int, heads: int = 8, pe_freqs: int = 16):
+    """
+    Swin 風格的「局部視窗 cross-attention」：
+      - Q 來自 tgt，K/V 來自 ref（兩者切同一組 window）
+      - 每個 window 內使用相對位置偏置（per-head）
+      - 支援可選 cyclic shift；預設關閉 (shift_size=0)
+    介面不變：forward(ref: [B,C,H,W], tgt: [B,C,H,W]) -> [B,C,H,W]
+    """
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        window_size: int = 8,
+        shift_size: int = 0,
+        use_abspe: bool = False,
+        pe_freqs: int = 16
+    ):
         super().__init__()
-        # 絕對 2D 位置編碼 → 1x1 投影到 dim，殘差相加
-        self.abs_pe_gen = SinCosPosEnc2D(num_freqs=pe_freqs)
-        self.abs_pe_proj = nn.Conv2d(4 * pe_freqs, dim, kernel_size=1, bias=False)
-        # 局部位置偏置（depthwise conv）
-        self.local_bias_q = ConvPosBias(dim)
-        self.local_bias_kv = ConvPosBias(dim)
-        # q/k/v 與 MHA
+        assert dim % heads == 0, "dim 必須可被 heads 整除"
+        self.dim = dim
+        self.heads = heads
+        self.win = int(window_size)
+        self.shift = int(shift_size)
+        self.scale = (dim // heads) ** -0.5
+
+        # 可選：保留你之前的絕對位置編碼（預設關閉）
+        self.use_abspe = bool(use_abspe)
+        if self.use_abspe:
+            self.abs_pe_gen = SinCosPosEnc2D(num_freqs=pe_freqs)
+            self.abs_pe_proj = nn.Conv2d(4 * pe_freqs, dim, kernel_size=1, bias=False)
+
+        # q/k/v/o
         self.q = nn.Conv2d(dim, dim, 1, bias=False)
         self.k = nn.Conv2d(dim, dim, 1, bias=False)
         self.v = nn.Conv2d(dim, dim, 1, bias=False)
-        self.mha = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=0.1)
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Dropout2d(0.10),
-            nn.Conv2d(dim, dim, 3, padding=1),
-            nn.Dropout2d(0.10),
-        )
+        self.proj = nn.Conv2d(dim, dim, 1, bias=False)
+
+        # layernorm（序列上做）
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
 
-    def forward(self, ref: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = tgt.shape
-        pe = self.abs_pe_proj(self.abs_pe_gen(H, W, tgt.device))  # [1,dim,H,W]
-        tgt_pe = self.local_bias_q(tgt + pe)
-        ref_pe = self.local_bias_kv(ref + pe)
+        # 相對位置偏置表（Swin 作法）
+        size = self.win
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * size - 1) * (2 * size - 1), heads)
+        )
+        # 預先計算 window 內每對位置的 index
+        coords_h = torch.arange(size)
+        coords_w = torch.arange(size)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # [2,w,w]
+        coords_flat = coords.flatten(1)                                          # [2,w*w]
+        rel = coords_flat[:, :, None] - coords_flat[:, None, :]                  # [2,w*w,w*w]
+        rel = rel.permute(1, 2, 0).contiguous()                                  # [w*w,w*w,2]
+        rel[..., 0] += size - 1
+        rel[..., 1] += size - 1
+        rel[..., 0] *= (2 * size - 1)
+        relative_position_index = rel.sum(-1)                                    # [w*w,w*w]
+        self.register_buffer("relative_position_index", relative_position_index, persistent=False)
 
-        q = self.q(tgt_pe).flatten(2).transpose(1, 2)  # [B,HW,C]
-        k = self.k(ref_pe).flatten(2).transpose(1, 2)
-        v = self.v(ref_pe).flatten(2).transpose(1, 2)
-        out, _ = self.mha(self.norm_q(q), self.norm_kv(k), self.norm_kv(v))
-        out = out.transpose(1, 2).view(B, C, H, W)
-        out = out + tgt  # 殘差
+        # FFN（保持你原本風格）
+        self.ffn = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, padding=1),
+        )
+
+        # 參數初始化（相對位置偏置）
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def _attend_one_level(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """
+        q/k/v: [B,C,H,W]  ->  window 化後做注意力 -> [B,C,H,W]
+        """
+        B, C, _, _ = q.shape
+        w = self.win
+
+        # partition windows
+        qw = window_partition(q, w)   # [B*nW, C, w, w]
+        kw = window_partition(k, w)
+        vw = window_partition(v, w)
+
+        # flatten to sequences & LN
+        token = w * w
+        qw = qw.flatten(2).transpose(1, 2)            # [B*nW, token, C]
+        kw = kw.flatten(2).transpose(1, 2)
+        vw = vw.flatten(2).transpose(1, 2)
+        qw = self.norm_q(qw)
+        kv = self.norm_kv(torch.cat([kw, vw], dim=1))
+        kw, vw = kv[:, :token], kv[:, token:]         # LN 後再切回
+
+        # split heads
+        hd = C // self.heads
+        qw = qw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)  # [B*nW,h,token,hd]
+        kw = kw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)
+        vw = vw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)
+
+        # scaled dot-product attention
+        attn = (qw @ kw.transpose(-2, -1)) * self.scale               # [B*nW,h,token,token]
+
+        # add relative position bias（同一個 bias 用在每個 window）
+        bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(token, token, self.heads).permute(2, 0, 1).unsqueeze(0)  # [1,h,token,token]
+        attn = attn + bias
+
+        attn = attn.softmax(dim=-1)
+        out = attn @ vw                                                # [B*nW,h,token,hd]
+        out = out.permute(0, 2, 1, 3).contiguous().view(-1, token, C)  # [B*nW,token,C]
+        out = out.transpose(1, 2).view(-1, C, w, w)                    # [B*nW,C,w,w]
+
+        # reverse windows
+        out = window_reverse(out, w, H, W)                             # [B,C,H,W]
+        return out
+
+    def forward(self, ref: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """
+        ref: [B,C,H,W] as K/V   ;   tgt: [B,C,H,W] as Q
+        """
+        B, C, H, W = tgt.shape
+
+        # optional cyclic shift（與 Swin 相同概念）
+        if self.shift > 0:
+            ref = torch.roll(ref, shifts=(-self.shift, -self.shift), dims=(2, 3))
+            tgt = torch.roll(tgt, shifts=(-self.shift, -self.shift), dims=(2, 3))
+
+        # optional absolute PE
+        if self.use_abspe:
+            pe = self.abs_pe_proj(self.abs_pe_gen(H, W, tgt.device))  # [1,C,H,W]
+            ref = ref + pe
+            tgt = tgt + pe
+
+        # qkv
+        q = self.q(tgt)
+        k = self.k(ref)
+        v = self.v(ref)
+
+        # windowed cross-attention
+        out = self._attend_one_level(q, k, v, H, W)
+
+        # reverse shift
+        if self.shift > 0:
+            out = torch.roll(out, shifts=(self.shift, self.shift), dims=(2, 3))
+
+        # 殘差 + FFN
+        out = self.proj(out)
+        out = out + tgt
         return out + self.ffn(out)
+    
+class WindowCrossAttnBlock(nn.Module):
+    """
+    一個 Swin 風格的「局部視窗 cross-attention」區塊：
+      - Q 來自 tgt，K/V 來自 ref，兩者用同樣切窗
+      - 視窗內使用相對位置偏置（per-head）
+      - 支援 cyclic shift
+      - 結尾：proj 殘差 + Conv-FFN 殘差（與你現有風格一致）
+    """
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        window_size: int = 8,
+        shift_size: int = 0,
+        use_abspe: bool = False,
+        pe_freqs: int = 16,
+    ):
+        super().__init__()
+        assert dim % heads == 0, "dim 必須可被 heads 整除"
+        self.dim = dim
+        self.heads = heads
+        self.win = int(window_size)
+        self.shift = int(shift_size)
+        self.scale = (dim // heads) ** -0.5
+
+        # 可選：疊一層絕對 PE（通常先關掉即可）
+        self.use_abspe = bool(use_abspe)
+        if self.use_abspe:
+            self.abs_pe_gen = SinCosPosEnc2D(num_freqs=pe_freqs)
+            self.abs_pe_proj = nn.Conv2d(4 * pe_freqs, dim, kernel_size=1, bias=False)
+
+        # q/k/v/o
+        self.q = nn.Conv2d(dim, dim, 1, bias=False)
+        self.k = nn.Conv2d(dim, dim, 1, bias=False)
+        self.v = nn.Conv2d(dim, dim, 1, bias=False)
+        self.proj = nn.Conv2d(dim, dim, 1, bias=False)
+
+        # LayerNorm（序列上）
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+
+        # 視窗內相對位置偏置（Swin）
+        size = self.win
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * size - 1) * (2 * size - 1), heads)
+        )
+        coords_h = torch.arange(size)
+        coords_w = torch.arange(size)
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # [2,w,w]
+        coords_flat = coords.flatten(1)                                          # [2,w*w]
+        rel = coords_flat[:, :, None] - coords_flat[:, None, :]                  # [2,w*w,w*w]
+        rel = rel.permute(1, 2, 0).contiguous()                                  # [w*w,w*w,2]
+        rel[..., 0] += size - 1
+        rel[..., 1] += size - 1
+        rel[..., 0] *= (2 * size - 1)
+        relative_position_index = rel.sum(-1)                                    # [w*w,w*w]
+        self.register_buffer("relative_position_index", relative_position_index, persistent=False)
+
+        # Conv-FFN
+        self.ffn = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, padding=1),
+        )
+
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def _attend_windows(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """q/k/v: [B,C,H,W]  ->  window 化後做注意力 -> [B,C,H,W]"""
+        B, C, _, _ = q.shape
+        w = self.win
+
+        qw = window_partition(q, w)   # [B*nW, C, w, w]
+        kw = window_partition(k, w)
+        vw = window_partition(v, w)
+
+        token = w * w
+        qw = qw.flatten(2).transpose(1, 2)            # [B*nW, token, C]
+        kw = kw.flatten(2).transpose(1, 2)
+        vw = vw.flatten(2).transpose(1, 2)
+
+        qw = self.norm_q(qw)
+        kv = self.norm_kv(torch.cat([kw, vw], dim=1))
+        kw, vw = kv[:, :token], kv[:, token:]
+
+        hd = C // self.heads
+        qw = qw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)  # [B*nW,h,token,hd]
+        kw = kw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)
+        vw = vw.view(-1, token, self.heads, hd).permute(0, 2, 1, 3)
+
+        attn = (qw @ kw.transpose(-2, -1)) * self.scale               # [B*nW,h,token,token]
+
+        bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(token, token, self.heads).permute(2, 0, 1).unsqueeze(0)  # [1,h,token,token]
+        attn = attn + bias
+        attn = attn.softmax(dim=-1)
+
+        out = attn @ vw                                                # [B*nW,h,token,hd]
+        out = out.permute(0, 2, 1, 3).contiguous().view(-1, token, C)  # [B*nW,token,C]
+        out = out.transpose(1, 2).view(-1, C, w, w)                    # [B*nW,C,w,w]
+
+        out = window_reverse(out, w, H, W)                             # [B,C,H,W]
+        return out
+
+    def forward(self, ref: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """
+        ref/tgt: [B,C,H,W]
+        注意：若 H/W 非 window_size 的整數倍，會自動 padding 再裁回
+        """
+        B, C, H, W = tgt.shape
+        w = self.win
+
+        # optional abs PE
+        if self.use_abspe:
+            pe = self.abs_pe_proj(self.abs_pe_gen(H, W, tgt.device))  # [1,C,H,W]
+            ref = ref + pe
+            tgt = tgt + pe
+
+        # padding（避免 H/W 不是 w 的整數倍）
+        pad_h = (w - H % w) % w
+        pad_w = (w - W % w) % w
+        if pad_h or pad_w:
+            ref = F.pad(ref, (0, pad_w, 0, pad_h))
+            tgt = F.pad(tgt, (0, pad_w, 0, pad_h))
+            Hp, Wp = ref.shape[-2:]
+        else:
+            Hp, Wp = H, W
+
+        # cyclic shift（若設定）
+        if self.shift > 0:
+            ref = torch.roll(ref, shifts=(-self.shift, -self.shift), dims=(2, 3))
+            tgt = torch.roll(tgt, shifts=(-self.shift, -self.shift), dims=(2, 3))
+
+        # qkv
+        q = self.q(tgt); k = self.k(ref); v = self.v(ref)
+        out = self._attend_windows(q, k, v, Hp, Wp)
+
+        # reverse shift
+        if self.shift > 0:
+            out = torch.roll(out, shifts=(self.shift, self.shift), dims=(2, 3))
+
+        # 去 padding
+        if pad_h or pad_w:
+            out = out[:, :, :H, :W]
+
+        # 殘差 + FFN
+        out = self.proj(out)
+        out = out + tgt
+        return out + self.ffn(out)
+
+
+class CrossAttentionFuseWin2(nn.Module):
+    """
+    兩層 Window Cross-Attn：
+      - 第1層：shift=0
+      - 第2層：shift=window_size//2（交錯視窗，打破區塊邊界）
+    與舊 CrossAttentionFuse 介面完全相同。
+    """
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        window_size: int = 8,
+        use_abspe: bool = False,
+        pe_freqs: int = 16,
+    ):
+        super().__init__()
+        self.blk1 = WindowCrossAttnBlock(
+            dim=dim, heads=heads, window_size=window_size, shift_size=0,
+            use_abspe=use_abspe, pe_freqs=pe_freqs
+        )
+        self.blk2 = WindowCrossAttnBlock(
+            dim=dim, heads=heads, window_size=window_size, shift_size=window_size // 2,
+            use_abspe=use_abspe, pe_freqs=pe_freqs
+        )
+
+    def forward(self, ref: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        x = self.blk1(ref, tgt)
+        x = self.blk2(ref, x)
+        return x
 
 class GridHead(nn.Module):
     def __init__(self, in_ch: int, num_classes: int = 3):
@@ -263,6 +523,55 @@ class Sam2TorchWrapper(nn.Module):
         # Upsample to a fixed size (256x256 typical), caller can resize to GT
         return low_res_masks  # [B,1,h,w]
 
+class HierProj(nn.Module):
+    """
+    階層式融合：
+    (SAM, DINO) → mid1 → (+proto) → mid2 → (+pseudo, coord, extra) → proj_dim
+    """
+    def __init__(self, proj_dim: int, e_channels: int = 0, use_coord: bool = True):
+        super().__init__()
+        self.use_coord = use_coord
+        self.e_channels = e_channels
+        d_mid = proj_dim          # 中間節點通道
+        d_small = proj_dim // 4   # 小型提示通道
+
+        # stage 1: 影像 backbone 融合
+        self.s1 = nn.Sequential(
+            nn.Conv2d(256+768, d_mid, 1, bias=False),
+            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
+        )
+        # stage 2: 加入 proto
+        self.s2 = nn.Sequential(
+            nn.Conv2d(d_mid+256, d_mid, 1, bias=False),
+            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
+        )
+        # 將小提示壓小再融合
+        self.pseudo_proj = nn.Conv2d(1, d_small, 1, bias=False)
+        self.coord_proj  = nn.Conv2d(2, d_small, 1, bias=False) if use_coord else None
+        self.extra_proj  = nn.Conv2d(e_channels, d_small, 1, bias=False) if e_channels>0 else None
+
+        # stage 3: 最終融合到 proj_dim
+        in_s3 = d_mid + d_small  # pseudo
+        if use_coord:   in_s3 += d_small
+        if e_channels>0:in_s3 += d_small
+
+        self.s3 = nn.Sequential(
+            nn.Conv2d(in_s3, proj_dim, 1, bias=False),
+            nn.BatchNorm2d(proj_dim), nn.ReLU(inplace=True)
+        )
+
+    def forward(self, sam32, dn32, proto_broad, pseudo, coord=None, extra=None):
+        x = self.s1(torch.cat([sam32, dn32], dim=1))
+        x = self.s2(torch.cat([x, proto_broad], dim=1))
+
+        tips = [self.pseudo_proj(pseudo)]
+        if self.use_coord and coord is not None:
+            tips.append(self.coord_proj(coord))
+        if self.e_channels>0 and extra is not None:
+            tips.append(self.extra_proj(extra))
+
+        x = self.s3(torch.cat([x] + tips, dim=1))
+        return x
 
 # -------------------------- Main model --------------------------
 class SupSegGridSAM2(nn.Module):
@@ -291,9 +600,6 @@ class SupSegGridSAM2(nn.Module):
         self.lambda_dice = float(lambda_dice)
         self.sam2_torch = sam2_torch
         self.sam2_pred = sam2_pred
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20), requires_grad=False)
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00),  requires_grad=False)
-        
 
         # SAM 64->32
         self.sam_down = nn.Sequential(
@@ -302,6 +608,7 @@ class SupSegGridSAM2(nn.Module):
         # Input channels: SAM(256) + DINO(768) + proto(256) + pseudo(1) + optional extra E
         # We'll dynamically add E at forward by concatenation then projecting with 1x1.
         self.share_proj = SharedProjector(256 + 768 + 256 + 1, proj_dim)
+        
         self.fuse = CrossAttentionFuse(proj_dim, heads=8)
         self.grid_head = GridHead(proj_dim, num_classes=3)
 
@@ -310,16 +617,14 @@ class SupSegGridSAM2(nn.Module):
         self.map_dn  = nn.Linear(768, proj_dim)
         self.proto_merge = nn.Linear(2*proj_dim, proj_dim)
 
-    def _make_pseudo(self, sam32, proto_fg, proto_bg=None):
-        sim_fg = cosine_sim_map(sam32, proto_fg)
+    def _make_pseudo(self, sam32: torch.Tensor, proto_fg: torch.Tensor, proto_bg: Optional[torch.Tensor] = None) -> torch.Tensor:
+        sim_fg = cosine_sim_map(sam32, proto_fg)  # [-1,1]
         if proto_bg is not None:
             sim_bg = cosine_sim_map(sam32, proto_bg)
-            t = self.pseudo_temp.clamp_min(1e-3)
-            b = self.pseudo_bias
-            s = torch.sigmoid((sim_fg - sim_bg - b) / t)
+            s = torch.sigmoid((sim_fg - sim_bg)/0.2)
         else:
-            s = (sim_fg + 1.0) / 2.0
-        return s
+            s = (sim_fg + 1.0)/2.0
+        return s  # [B,1,32,32] in [0,1]
 
     def _proto_tokens(self, p_fg_sam: torch.Tensor, p_bg_sam: torch.Tensor,
                       p_fg_dn: torch.Tensor,  p_bg_dn: torch.Tensor) -> torch.Tensor:
@@ -366,14 +671,11 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                     k_pos: int = 1, k_neg: int = 1, tau: float = 1.0,
                     lambda_ce: float = 1.0, lambda_dice: float = 1.0,
                     sam2_torch: Optional[Sam2TorchWrapper] = None, sam2_pred=None,
-                    use_coord: bool = True, e_channels: int = 2, pe_freqs: int = 16):
+                    use_coord: bool = True, e_channels: int = 0, pe_freqs: int = 16):
         super().__init__(proj_dim, pos_th, neg_th, k_pos, k_neg, tau,
                             lambda_ce, lambda_dice, sam2_torch, sam2_pred)
         self.use_coord = bool(use_coord)
         self.e_channels = int(e_channels)
-
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20))  # 初始保持原本 0.2
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00))
 
         # 重新設定 share_proj 的輸入通道（原: 256 + 768 + 256 + 1）
         base_in = 256 + 768 + 256 + 1
@@ -381,10 +683,13 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             base_in += 2  # (x,y)
         base_in += self.e_channels  # 若會傳 extra_maps32
 
-        self.share_proj = HierProj(proj_dim=proj_dim, e_channels=self.e_channels, use_coord=self.use_coord)
+        self.share_proj = HierProj(proj_dim, e_channels=self.e_channels, use_coord=self.use_coord)
 
         # 替換 fuse 為帶 PE 的版本
         self.fuse = CrossAttentionFuse(proj_dim, heads=8, pe_freqs=pe_freqs)
+        
+        self.ref_mix = nn.Conv2d(proj_dim * 2, proj_dim, kernel_size=1, bias=False)
+        
 
         # Local conv path（保留空間局部性）
         self.local_path = nn.Sequential(
@@ -398,14 +703,12 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         # 門控融合（SE風格）：根據空間全域訊息調整 attn/local 權重
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(proj_dim * 2, proj_dim // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(proj_dim // 4, 2, 1),
-            nn.Sigmoid()  # 兩路權重 ∈ (0,1)
+            nn.Conv2d(proj_dim * 2, proj_dim, kernel_size=1),  # 通道級 gate
+            nn.Sigmoid()
         )
 
         # grid head 可沿用；若想更在地，可換成擴張卷積/多層
-        # self.grid_head = GridHead(proj_dim, num_classes=3)
+        self.grid_head = GridHead(proj_dim, num_classes=3)
 
     @staticmethod
     def _coord_maps(B: int, H: int, W: int, device) -> torch.Tensor:
@@ -416,65 +719,42 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         coord = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)  # [B,2,H,W]
         return coord.contiguous()
 
-    def forward_grid(self,
-                        sam_tgt_64: torch.Tensor,
-                        dino_tgt_32: torch.Tensor,
-                        proto_fg_sam: torch.Tensor,
-                        proto_bg_sam: torch.Tensor,
-                        proto_fg_dn:  torch.Tensor,
-                        proto_bg_dn:  torch.Tensor,
-                        extra_maps32: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        回傳 [B,3,16,16]；與父類別相同，但在 32x32 特徵融合時加入：
-            CoordConv + PE CrossAttn + Local Conv + 門控融合。
-        """
+    def forward_grid(self, sam_tgt_64, dino_tgt_32,
+                     proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn,
+                     extra_maps32: Optional[torch.Tensor] = None) -> torch.Tensor:
         B = sam_tgt_64.size(0)
-        sam32 = self.sam_down(sam_tgt_64)  # [B,256,32,32]
-        dn32  = dino_tgt_32               # [B,768,32,32]
+    
+        # 32x32 特徵
+        sam32 = self.sam_down(sam_tgt_64)   # [B,256,32,32]
+        dn32  = dino_tgt_32                 # [B,768,32,32]
         pseudo = self._make_pseudo(sam32, proto_fg_sam, proto_bg_sam)  # [B,1,32,32]
-
-        # 先算兩張相似度圖
-        sim_fg = cosine_sim_map(sam32, proto_fg_sam)   # [B,1,32,32]
-        sim_bg = cosine_sim_map(sam32, proto_bg_sam)   # [B,1,32,32]
-        
-        # 新增 BG 原型 broadcast
-        p_broad_fg = proto_fg_sam.view(B, -1, 1, 1).expand(-1, proto_fg_sam.size(1), 32, 32)
-        p_broad_bg = proto_bg_sam.view(B, -1, 1, 1).expand(-1, proto_bg_sam.size(1), 32, 32)
-        
-        
-        # CoordConv
-        coord = self._coord_maps(B, 32, 32, sam32.device) if self.use_coord else None
-
-        # 額外圖層
-        extra_list = []
-        if extra_maps32 is not None:
-            extra_list.append(extra_maps32)         # 既有的 extra
-        extra_list += [sim_fg, sim_bg]              # 新增兩張相似度圖
-        extra = torch.cat(extra_list, dim=1) if len(extra_list) > 0 else None
-        
-        x = self.share_proj(
-            sam32, dn32,
-            torch.cat([p_broad_fg, p_broad_bg], dim=1),
-            pseudo,
-            coord=coord,
-            extra=extra
-        )
-
-        # Proto tokens → 產出 ref（保持你原本的作法）
-        ptoks = self._proto_tokens(proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
-        ref = ptoks.mean(dim=1).unsqueeze(-1).unsqueeze(-1).expand(-1, x.size(1), 32, 32)
-
+    
+        # 原型 broadcast（前景向量鋪滿；背景不鋪，保留對比在 ref 端）
+        p_broad = proto_fg_sam.view(B, -1, 1, 1).expand(-1, proto_fg_sam.size(1), sam32.size(2), sam32.size(3))
+    
+        # Coord（HierProj 需要單獨傳入）
+        coord = self._coord_maps(B, sam32.size(2), sam32.size(3), sam32.device) if self.use_coord else None
+    
+        # 用 HierProj 的多輸入介面，避免一次大拼接
+        x = self.share_proj(sam32, dn32, p_broad, pseudo, coord=coord, extra=extra_maps32)   # [B,proj,32,32]
+    
+        # 保留 fg/bg 對比，建立 ref ----
+        ptoks = self._proto_tokens(proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)     # [B,2,proj]
+        C, H, W = x.size(1), x.size(2), x.size(3)
+        fg = ptoks[:, 0].unsqueeze(-1).unsqueeze(-1).expand(-1, C, H, W)  # [B,C,H,W]
+        bg = ptoks[:, 1].unsqueeze(-1).unsqueeze(-1).expand(-1, C, H, W)  # [B,C,H,W]
+        ref = self.ref_mix(torch.cat([fg, bg], dim=1))                     # [B,C,H,W]
+    
         # 兩路：Attn 與 Local
-        x_attn  = self.fuse(ref, x)          # [B,proj,32,32]
-        x_local = self.local_path(x) + x     # 在地殘差
-
-        # 門控融合
-        g = self.gate(torch.cat([x_attn, x_local], dim=1))   # [B,2,1,1]；兩路權重
-        wa = g[:, 0:1]; wl = g[:, 1:2]
-        x_fused = wa * x_attn + wl * x_local
-
-        # 進 grid head（16x16 三分類）
-        return self.grid_head(x_fused)
+        x_attn  = self.fuse(ref, x)               # [B,proj,H,W]
+        x_local = self.local_path(x) + x          # [B,proj,H,W]
+    
+        # 通道級門控融合 ----
+        g = self.gate(torch.cat([x_attn, x_local], dim=1))  # [B,C,1,1]
+        x_fused = g * x_attn + (1.0 - g) * x_local
+    
+        return self.grid_head(x_fused)  # [B,3,16,16]
+    
 
     # def points_from_grid(self, grid_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     #     """

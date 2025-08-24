@@ -52,8 +52,8 @@ def make_grid_labels(gt_mask_512: torch.Tensor, pos_th: float = 0.7, neg_th: flo
     """gt_mask_512: [B,1,512,512] float/bool -> [B,16,16] long in {0(pos),1(neg),2(neu)}"""
     ratio = F.avg_pool2d(gt_mask_512.float(), kernel_size=32, stride=32)  # [B,1,16,16]
     y = torch.full_like(ratio, 2)  # neutral
-    y[ratio >= pos_th] = 0
-    y[ratio <= neg_th] = 1
+    y[ratio > pos_th] = 0
+    y[ratio < neg_th] = 1
     return y.squeeze(1).long()
 
 
@@ -104,58 +104,8 @@ class ConvPosBias(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.dw(x)
-    
-class HierProj(nn.Module):
-    """
-    階層式融合：
-    (SAM, DINO) → mid1 → (+proto) → mid2 → (+pseudo, coord, extra) → proj_dim
-    """
-    def __init__(self, proj_dim: int, e_channels: int = 0, use_coord: bool = True):
-        super().__init__()
-        self.use_coord = use_coord
-        self.e_channels = e_channels
-        d_mid = proj_dim          # 中間節點通道
-        d_small = max(32, proj_dim // 4)
 
-        # stage 1: 影像 backbone 融合
-        self.s1 = nn.Sequential(
-            nn.Conv2d(256+768, d_mid, 1, bias=False),
-            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
-        )
-        # stage 2: 加入 proto
-        self.s2 = nn.Sequential(
-            nn.Conv2d(d_mid+512, d_mid, 1, bias=False),  # ← 接收 FG(256)+BG(256)
-            nn.BatchNorm2d(d_mid), nn.ReLU(inplace=True)
-        )
-        
-        # 將小提示壓小再融合
-        self.pseudo_proj = nn.Conv2d(1, d_small, 1, bias=False)
-        self.coord_proj  = nn.Conv2d(2, d_small, 1, bias=False) if use_coord else None
-        self.extra_proj  = nn.Conv2d(e_channels, d_small, 1, bias=False) if e_channels>0 else None
-
-        # stage 3: 最終融合到 proj_dim
-        in_s3 = d_mid + d_small  # pseudo
-        if use_coord:   in_s3 += d_small
-        if e_channels>0:in_s3 += d_small
-
-        self.s3 = nn.Sequential(
-            nn.Conv2d(in_s3, proj_dim, 1, bias=False),
-            nn.BatchNorm2d(proj_dim), nn.ReLU(inplace=True)
-        )
-
-    def forward(self, sam32, dn32, proto_broad, pseudo, coord=None, extra=None):
-        x = self.s1(torch.cat([sam32, dn32], dim=1))
-        x = self.s2(torch.cat([x, proto_broad], dim=1))
-
-        tips = [self.pseudo_proj(pseudo)]
-        if self.use_coord and coord is not None:
-            tips.append(self.coord_proj(coord))
-        if self.e_channels>0 and extra is not None:
-            tips.append(self.extra_proj(extra))
-
-        x = self.s3(torch.cat([x] + tips, dim=1))
-        return x
-    
+# ---- Replace original CrossAttentionFuse with this version ----
 class CrossAttentionFuse(nn.Module):
     def __init__(self, dim: int, heads: int = 8, pe_freqs: int = 16):
         super().__init__()
@@ -169,13 +119,11 @@ class CrossAttentionFuse(nn.Module):
         self.q = nn.Conv2d(dim, dim, 1, bias=False)
         self.k = nn.Conv2d(dim, dim, 1, bias=False)
         self.v = nn.Conv2d(dim, dim, 1, bias=False)
-        self.mha = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=0.1)
+        self.mha = nn.MultiheadAttention(dim, heads, batch_first=True)
         # FFN
         self.ffn = nn.Sequential(
             nn.Conv2d(dim, dim, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Dropout2d(0.10),
             nn.Conv2d(dim, dim, 3, padding=1),
-            nn.Dropout2d(0.10),
         )
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
@@ -291,9 +239,6 @@ class SupSegGridSAM2(nn.Module):
         self.lambda_dice = float(lambda_dice)
         self.sam2_torch = sam2_torch
         self.sam2_pred = sam2_pred
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20), requires_grad=False)
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00),  requires_grad=False)
-        
 
         # SAM 64->32
         self.sam_down = nn.Sequential(
@@ -310,16 +255,14 @@ class SupSegGridSAM2(nn.Module):
         self.map_dn  = nn.Linear(768, proj_dim)
         self.proto_merge = nn.Linear(2*proj_dim, proj_dim)
 
-    def _make_pseudo(self, sam32, proto_fg, proto_bg=None):
-        sim_fg = cosine_sim_map(sam32, proto_fg)
+    def _make_pseudo(self, sam32: torch.Tensor, proto_fg: torch.Tensor, proto_bg: Optional[torch.Tensor] = None) -> torch.Tensor:
+        sim_fg = cosine_sim_map(sam32, proto_fg)  # [-1,1]
         if proto_bg is not None:
             sim_bg = cosine_sim_map(sam32, proto_bg)
-            t = self.pseudo_temp.clamp_min(1e-3)
-            b = self.pseudo_bias
-            s = torch.sigmoid((sim_fg - sim_bg - b) / t)
+            s = torch.sigmoid((sim_fg - sim_bg)/0.2)
         else:
-            s = (sim_fg + 1.0) / 2.0
-        return s
+            s = (sim_fg + 1.0)/2.0
+        return s  # [B,1,32,32] in [0,1]
 
     def _proto_tokens(self, p_fg_sam: torch.Tensor, p_bg_sam: torch.Tensor,
                       p_fg_dn: torch.Tensor,  p_bg_dn: torch.Tensor) -> torch.Tensor:
@@ -366,14 +309,11 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                     k_pos: int = 1, k_neg: int = 1, tau: float = 1.0,
                     lambda_ce: float = 1.0, lambda_dice: float = 1.0,
                     sam2_torch: Optional[Sam2TorchWrapper] = None, sam2_pred=None,
-                    use_coord: bool = True, e_channels: int = 2, pe_freqs: int = 16):
+                    use_coord: bool = True, e_channels: int = 0, pe_freqs: int = 16):
         super().__init__(proj_dim, pos_th, neg_th, k_pos, k_neg, tau,
                             lambda_ce, lambda_dice, sam2_torch, sam2_pred)
         self.use_coord = bool(use_coord)
         self.e_channels = int(e_channels)
-
-        self.pseudo_temp = nn.Parameter(torch.tensor(0.20))  # 初始保持原本 0.2
-        self.pseudo_bias = nn.Parameter(torch.tensor(0.00))
 
         # 重新設定 share_proj 的輸入通道（原: 256 + 768 + 256 + 1）
         base_in = 256 + 768 + 256 + 1
@@ -381,7 +321,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             base_in += 2  # (x,y)
         base_in += self.e_channels  # 若會傳 extra_maps32
 
-        self.share_proj = HierProj(proj_dim=proj_dim, e_channels=self.e_channels, use_coord=self.use_coord)
+        self.share_proj = SharedProjector(base_in, proj_dim)
 
         # 替換 fuse 為帶 PE 的版本
         self.fuse = CrossAttentionFuse(proj_dim, heads=8, pe_freqs=pe_freqs)
@@ -433,32 +373,26 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         dn32  = dino_tgt_32               # [B,768,32,32]
         pseudo = self._make_pseudo(sam32, proto_fg_sam, proto_bg_sam)  # [B,1,32,32]
 
-        # 先算兩張相似度圖
-        sim_fg = cosine_sim_map(sam32, proto_fg_sam)   # [B,1,32,32]
-        sim_bg = cosine_sim_map(sam32, proto_bg_sam)   # [B,1,32,32]
-        
-        # 新增 BG 原型 broadcast
-        p_broad_fg = proto_fg_sam.view(B, -1, 1, 1).expand(-1, proto_fg_sam.size(1), 32, 32)
-        p_broad_bg = proto_bg_sam.view(B, -1, 1, 1).expand(-1, proto_bg_sam.size(1), 32, 32)
-        
-        
+        # 原型向量 broadcast（保留）
+        p_broad = proto_fg_sam.view(B, -1, 1, 1).expand(-1, proto_fg_sam.size(1), 32, 32)
+
+        xs = [sam32, dn32, p_broad, pseudo]
+
         # CoordConv
-        coord = self._coord_maps(B, 32, 32, sam32.device) if self.use_coord else None
+        if self.use_coord:
+            xs.append(self._coord_maps(B, 32, 32, sam32.device))
 
         # 額外圖層
-        extra_list = []
         if extra_maps32 is not None:
-            extra_list.append(extra_maps32)         # 既有的 extra
-        extra_list += [sim_fg, sim_bg]              # 新增兩張相似度圖
-        extra = torch.cat(extra_list, dim=1) if len(extra_list) > 0 else None
-        
-        x = self.share_proj(
-            sam32, dn32,
-            torch.cat([p_broad_fg, p_broad_bg], dim=1),
-            pseudo,
-            coord=coord,
-            extra=extra
-        )
+            assert extra_maps32.size(-1) == 32 and extra_maps32.size(-2) == 32, \
+                f"extra_maps32 必須是 32x32，但得到 {tuple(extra_maps32.shape)}"
+            if self.e_channels > 0:
+                assert extra_maps32.size(1) == self.e_channels, \
+                    f"建構子宣告 e_channels={self.e_channels}，但實際傳入 {extra_maps32.size(1)}"
+            xs.append(extra_maps32)
+
+        x = torch.cat(xs, dim=1)             # [B,Cin,32,32]
+        x = self.share_proj(x)               # [B,proj,32,32]
 
         # Proto tokens → 產出 ref（保持你原本的作法）
         ptoks = self._proto_tokens(proto_fg_sam, proto_bg_sam, proto_fg_dn, proto_bg_dn)
@@ -728,7 +662,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         logits: torch.Tensor,         # [B, 3, H, W]，你的 grid_logits
         targets: torch.Tensor,        # [B, H, W]，0=pos, 1=neg, 2=neutral
         gamma: float = 2.0,           # 焦點參數，越大越聚焦困難樣本
-        alpha_pos: float = 3.0,       # 正類權重（> neg）
+        alpha_pos: float = 2.0,       # 正類權重（> neg）
         alpha_neg: float = 1.0,       # 負類權重
         ignore_index: int = 2,        # 忽略 neutral
         normalize_by_weight: bool = True,  # 用加權樣本數作分母，穩定尺度
@@ -788,7 +722,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             ce = self.focal_loss_multiclass_ignore_neutral(
                 grid_logits, y,
                 gamma=2.0,      # 常用 1.5~2.5
-                alpha_pos=3.0,  # 正類較重
+                alpha_pos=2.0,  # 正類較重
                 alpha_neg=1.0,  # 負類較輕
                 ignore_index=2,
             )
