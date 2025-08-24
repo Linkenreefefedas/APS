@@ -12,7 +12,7 @@ from dataloader_ps import build_psv2_index as build_coco20i_index
 from dataloader_ps import OneShotPSV2Random as OneShotCOCO20iRandom
 
 # from our modules above
-from supseg_model import Sam2TorchWrapper,SupSegGridSAM2Spatial,CrossAttentionFuseWin2
+from supseg_model import Sam2TorchWrapper,SupSegGridSAM2Spatial
 from supseg_dataset import SupEpisodeAdapter
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
@@ -153,14 +153,14 @@ def main():
         use_coord=True, e_channels=0, pe_freqs=16
     ).to(device)
     
-    # 直接把單層 fuse 換成「雙層 Window Fuse」
-    model.fuse = CrossAttentionFuseWin2(
-        dim=256,           # 要和 proj_dim 一致
-        heads=8,           # 和原本一致
-        window_size=8,     # 32×32 特徵 → 8 最剛好（切 4×4 個窗）
-        use_abspe=False,   # 先關；若想再加絕對PE再開 True
-        pe_freqs=16
-    ).to(device)
+    # # 直接把單層 fuse 換成「雙層 Window Fuse」
+    # model.fuse = CrossAttentionFuseWin2(
+    #     dim=256,           # 要和 proj_dim 一致
+    #     heads=8,           # 和原本一致
+    #     window_size=8,     # 32×32 特徵 → 8 最剛好（切 4×4 個窗）
+    #     use_abspe=False,   # 先關；若想再加絕對PE再開 True
+    #     pe_freqs=16
+    # ).to(device)
     
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
