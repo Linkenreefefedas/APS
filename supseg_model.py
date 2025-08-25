@@ -17,7 +17,7 @@ from typing import Dict, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+ggt=0
 
 # -------------------------- small utils --------------------------
 def mask_average_pool(feat: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -375,8 +375,6 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         self.e_channels = int(e_channels)
         self.lambda_aux = float(lambda_aux)  # auxiliary mask loss weight
 
-        self.register_buffer("pseudo_temp", torch.tensor(0.20))
-        self.register_buffer("pseudo_bias", torch.tensor(0.00))
 
         # 重新設定 share_proj 的輸入通道（原: 256 + 768 + 256 + 1）
         base_in = 256 + 768 + 256 + 1
@@ -416,8 +414,6 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             nn.Conv2d(proj_dim//2, 1, 1)  # logits at 64×64
         )
         
-        self.aux_mask_weight = 0.3  # 初期 0.2~0.3，之後可調
-
         # grid head 可沿用；若想更在地，可換成擴張卷積/多層
         # self.grid_head = GridHead(proj_dim, num_classes=3)
 
@@ -583,166 +579,150 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
     #     return pts_px, labels
 
     def points_from_grid(self, grid_logits: torch.Tensor):
-        """
-        grid_logits: [B,3,16,16]
-        回傳:
-          points_xy: [B,K,2]  (K = self.k_pos + self.k_neg)，影像像素座標(對 512x512)
-          labels:    [B,K]    (1=pos, 0=neg)
-        """
-        import torch
-        import torch.nn.functional as F
-    
-        B, C, H, W = grid_logits.shape  # H=W=16
-        # 對 pos/neg 做溫度縮放，neutral 不動；τ<1 時會讓峰更尖
-        tau32 = float(getattr(self, "tau", 1.0))
-        logits = grid_logits.clone()
-        logits[:, 0:2] = logits[:, 0:2] / max(1e-6, tau32)
-        P = F.softmax(logits, dim=1)
-        pos_map = P[:, 0:1]  # [B,1,H,W]
-        neg_map = P[:, 1:2]
-    
-        # 可調參數（不在屬性時給預設）
-        cand_factor = getattr(self, "cand_factor", 5)      # 候選放大倍數
-        min_dist    = float(getattr(self, "nms_min_dist", 2.0))  # 格為單位的最小距離
-        th_pos      = getattr(self, "peak_th_pos", 0.5)   # 0~1；None=不設門檻
-        th_neg      = getattr(self, "peak_th_neg", 0.6)
-        r           = getattr(self, "refine_r", 1)         # 精修半徑: 1→3x3, 2→5x5
-        tau         = float(getattr(self, "tau", 1.0))
-    
-        def _topk_candidates(heat: torch.Tensor, k: int, th: float | None):
-            # 先做局部極大值（3x3）再取較多候選
-            pool = F.max_pool2d(heat, 3, 1, 1)
-            keep = (heat == pool) * heat
-            if th is not None:
-                keep = torch.where(keep > th, keep, keep.new_zeros(keep.shape))
-            scores = keep.view(B, -1)                                         # [B,H*W]
-            topk = min(max(k * cand_factor, k), scores.size(1))               # 至少 k
-            topv, topi = torch.topk(scores, k=topk, dim=1)
-            ys, xs = (topi // W).float(), (topi % W).float()
-            coords = torch.stack([xs, ys], dim=-1)                            # [B,topk,2]
-            return coords, topv                                               # 均為 tensor
-    
-        def _greedy_nms_single(coords_b: torch.Tensor, scores_b: torch.Tensor,
-                               k_keep: int, min_d: float):
-            # coords_b: [M,2], scores_b: [M]
-            if k_keep <= 0 or coords_b.numel() == 0:
-                return coords_b.new_zeros((0, 2)), scores_b.new_zeros((0,))
-            order = scores_b.argsort(descending=True)
-            coords_b = coords_b[order]
-            scores_b = scores_b[order]
-            keep_idx = []
-            for i in range(coords_b.size(0)):
-                if len(keep_idx) == 0:
-                    keep_idx.append(i)
-                else:
-                    # 與已保留點的最小距離（在 grid 座標上）
-                    d = torch.cdist(coords_b[i:i+1], coords_b[keep_idx]).squeeze(0)
-                    if d.min() >= min_d:
-                        keep_idx.append(i)
-                if len(keep_idx) >= k_keep:
-                    break
-            keep_idx = torch.tensor(keep_idx, device=coords_b.device, dtype=torch.long)
-            kept_c = coords_b[keep_idx]
-            kept_s = scores_b[keep_idx]
-            # 若不夠 k_keep，從剩餘（被距離抑制掉的）裡，依分數補齊至定長
-            if kept_c.size(0) < k_keep and coords_b.size(0) > kept_c.size(0):
-                mask = torch.ones(coords_b.size(0), device=coords_b.device, dtype=torch.bool)
-                mask[keep_idx] = False
-                rest_c = coords_b[mask]
-                rest_s = scores_b[mask]
-                need = k_keep - kept_c.size(0)
-                add_n = min(need, rest_c.size(0))
-                if add_n > 0:
-                    kept_c = torch.cat([kept_c, rest_c[:add_n]], dim=0)
-                    kept_s = torch.cat([kept_s, rest_s[:add_n]], dim=0)
-            # 若候選本來就少於 k_keep，這裡可能仍小於 k_keep；下面會再補保底正點
-            return kept_c, kept_s
-    
-        def _refine_local_single(heat_b: torch.Tensor, xy_g_b: torch.Tensor):
-            # heat_b: [1,1,H,W]；xy_g_b: [k,2]（grid coords, float）
-            if xy_g_b.numel() == 0:
-                return xy_g_b
-            k = xy_g_b.size(0)
-            cx = xy_g_b[:, 0].round().clamp_(0, W - 1).long()
-            cy = xy_g_b[:, 1].round().clamp_(0, H - 1).long()
-            out = []
-            for i in range(k):
-                x0 = max(0, cx[i].item() - r); x1 = min(W, cx[i].item() + r + 1)
-                y0 = max(0, cy[i].item() - r); y1 = min(H, cy[i].item() + r + 1)
-                patch = heat_b[:, :, y0:y1, x0:x1]  # [1,1,hh,ww]
-                hh, ww = patch.shape[-2:]
-                logits = torch.log(patch.clamp_min(1e-8)).view(1, -1)
-                sm = F.softmax(logits / max(1e-6, tau), dim=1).view(1, 1, hh, ww)
-                xs = torch.linspace(0, ww - 1, ww, device=heat_b.device).view(1, 1, 1, ww)
-                ys = torch.linspace(0, hh - 1, hh, device=heat_b.device).view(1, 1, hh, 1)
-                dx = (sm * xs).sum(dim=(2, 3))
-                dy = (sm * ys).sum(dim=(2, 3))
-                gx = x0 + dx.squeeze()
-                gy = y0 + dy.squeeze()
-                out.append(torch.stack([gx, gy], dim=-1))
-            return torch.stack(out, dim=0)  # [k,2]
-    
-        # 1) 候選（帶 3×3 局部極大值 NMS + 門檻）
-        pos_cand, pos_v = _topk_candidates(pos_map, self.k_pos, th_pos)
-        neg_cand, neg_v = _topk_candidates(neg_map, self.k_neg, th_neg)
-    
-        # 2) 類內貪婪 NMS +（必要時）補齊到定長
-        pos_list, neg_list = [], []
-        for b in range(B):
-            pc, _ = _greedy_nms_single(pos_cand[b], pos_v[b], self.k_pos, min_dist)
-            nc, _ = _greedy_nms_single(neg_cand[b], neg_v[b], self.k_neg, min_dist)
-            pos_list.append(pc)
-            neg_list.append(nc)
-    
-        # 3) 正點保底：若 k_pos>0 但該圖沒有正點，補 global argmax
-        if self.k_pos > 0:
-            flat = pos_map.view(B, -1)
-            topi = flat.argmax(dim=1)
-            ys0 = (topi // W).float(); xs0 = (topi % W).float()
-            gmax = torch.stack([xs0, ys0], dim=-1)  # [B,2]
-            for b in range(B):
-                if pos_list[b].size(0) == 0:
-                    pos_list[b] = gmax[b:b+1]  # [1,2]
-                # 若仍不足 k_pos（候選太少），重複最後一個保底填滿到定長
-                if pos_list[b].size(0) < self.k_pos:
-                    need = self.k_pos - pos_list[b].size(0)
-                    pos_list[b] = torch.cat([pos_list[b], pos_list[b][-1:].repeat(need, 1)], dim=0)
-    
-        # 4) 若負點不足，同樣重複最後一個填滿到定長（維持輸出形狀）
-        for b in range(B):
-            if neg_list[b].size(0) < self.k_neg and self.k_neg > 0:
-                if neg_list[b].size(0) == 0:
-                    # 用 neg_map 的 global argmax 當起點
-                    flatn = neg_map.view(B, -1)
-                    topin = flatn.argmax(dim=1)
-                    ys1 = (topin // W).float(); xs1 = (topin % W).float()
-                    gmaxn = torch.stack([xs1, ys1], dim=-1)  # [B,2]
-                    neg_list[b] = gmaxn[b:b+1]
-                need = self.k_neg - neg_list[b].size(0)
-                neg_list[b] = torch.cat([neg_list[b], neg_list[b][-1:].repeat(need, 1)], dim=0)
-    
-        # 5) 局部精修（建議：先 NMS 再 refine；這裡逐圖處理）
-        pos_refined, neg_refined = [], []
-        for b in range(B):
-            pos_refined.append(_refine_local_single(pos_map[b:b+1], pos_list[b]))  # [kp,2]
-            neg_refined.append(_refine_local_single(neg_map[b:b+1], neg_list[b]))  # [kn,2]
-    
-        # 6) 拼接 + 映射到像素（512）；輸出固定長度 K = k_pos + k_neg
-        kp, kn = self.k_pos, self.k_neg
-        pts_g = torch.stack([torch.cat([pos_refined[b], neg_refined[b]], dim=0)
-                             for b in range(B)], dim=0)                           # [B,K,2]
-        scale_x = 512.0 / W
-        scale_y = 512.0 / H
-        pts_px = torch.stack([(pts_g[..., 0] + 0.5) * scale_x,
-                              (pts_g[..., 1] + 0.5) * scale_y], dim=-1)           # [B,K,2]
-    
-        labels = torch.zeros(B, kp + kn, device=grid_logits.device, dtype=torch.long)
-        if kp > 0:
-            labels[:, :kp] = 1  # 前 kp 個為正，其餘為負
-    
-        return pts_px, labels
-    
-    
+      """
+      輸入:  grid_logits [B,3,16,16]
+      輸出:  pts_px_list: List[Tensor (K_i,2)]  (像素座標，對 cache_long；K_i ∈ [1, kp+kn])
+            lbl_list:    List[Tensor (K_i,)]    (1=pos, 0=neg)
+      規則:
+        - 先信心門檻(th_pos/th_neg)再 NMS；只收合格者，kp/kn 為上限，不硬湊。
+        - 最少 1 點：若兩類皆為 0，取 pos_map 全局 argmax 作為唯一正點。
+      """
+      import torch
+      import torch.nn.functional as F
+
+      B, C, H, W = grid_logits.shape         # 期望 H=W=16
+      tau = float(getattr(self, "tau", 1.0))
+      cache_long = int(getattr(self, "cache_long", 512))
+
+      # --- softmax 前溫度縮放（僅 pos/neg），neutral 不動 ---
+      logits = grid_logits.clone()
+      logits[:, 0:2] = logits[:, 0:2] / max(1e-6, tau)
+      P = F.softmax(logits, dim=1)
+      pos_map = P[:, 0:1]                     # [B,1,H,W]
+      neg_map = P[:, 1:2]
+
+      # 參數（若未在 model 上設定則給預設）
+      kp, kn = int(getattr(self, "k_pos", 0)), int(getattr(self, "k_neg", 0))  # 上限
+      cand_factor = int(getattr(self, "cand_factor", 5))
+      min_dist    = float(getattr(self, "nms_min_dist", 2.0))   # 以 grid 為單位
+      th_pos      = float(getattr(self, "peak_th_pos", 0.5))    # 信心門檻
+      th_neg      = float(getattr(self, "peak_th_neg", 0.8))
+      r           = int(getattr(self, "refine_r", 1))           # 1→3x3, 2→5x5
+
+      # --- 候選：先 3×3 極大值，再套信心門檻，最後取較多候選 ---
+      def _candidates(heat: torch.Tensor, kmax: int, th: float):
+          if kmax <= 0:
+              z = heat.new_zeros((heat.size(0), 0, 2)); v = heat.new_zeros((heat.size(0), 0))
+              return z, v
+          pool = F.max_pool2d(heat, 3, 1, 1)
+          keep = (heat == pool) * heat
+          keep = torch.where(keep >= th, keep, keep.new_zeros(keep.shape))
+          scores = keep.view(heat.size(0), -1)                 # [B,H*W]，門檻以下已是 0
+          topk = min(max(kmax * cand_factor, kmax), scores.size(1))
+          topv, topi = torch.topk(scores, k=topk, dim=1)
+          ys, xs = (topi // W).float(), (topi % W).float()
+          coords = torch.stack([xs, ys], dim=-1)               # [B,topk,2]
+          return coords, topv                                  # topv 會含 0（未達門檻）
+
+      pos_cand, pos_v = _candidates(pos_map, kp, th_pos)
+      neg_cand, neg_v = _candidates(neg_map, kn, th_neg)
+
+      # --- 類內 greedy NMS（只保留「分數 > 0」的合格候選；不硬湊到定長） ---
+      def _nms_single(coords_b, scores_b, k_keep, min_d):
+          # 先過濾未達門檻（score=0）
+          if scores_b.numel() == 0:
+              return coords_b.new_zeros((0, 2)), scores_b.new_zeros((0,))
+          valid = scores_b > 0
+          coords_b = coords_b[valid]
+          scores_b = scores_b[valid]
+          if k_keep <= 0 or coords_b.numel() == 0:
+              return coords_b.new_zeros((0, 2)), scores_b.new_zeros((0,))
+          order = scores_b.argsort(descending=True)
+          coords_b = coords_b[order]; scores_b = scores_b[order]
+          keep_idx = []
+          for i in range(coords_b.size(0)):
+              if not keep_idx:
+                  keep_idx.append(i)
+              else:
+                  d = torch.cdist(coords_b[i:i+1], coords_b[keep_idx]).squeeze(0)
+                  if d.min() >= min_d:
+                      keep_idx.append(i)
+              if len(keep_idx) >= k_keep:  # 上限，不硬湊
+                  break
+          keep_idx = torch.tensor(keep_idx, device=coords_b.device, dtype=torch.long)
+          return coords_b[keep_idx], scores_b[keep_idx]
+
+      pos_list, neg_list = [], []
+      for b in range(B):
+          pc, _ = _nms_single(pos_cand[b], pos_v[b], kp, min_dist)
+          nc, _ = _nms_single(neg_cand[b], neg_v[b], kn, min_dist)
+          pos_list.append(pc); neg_list.append(nc)
+
+      #  最少 1「正」點：只要正點為 0，就取 pos_map 全域 argmax 補 1 個正點
+      flat = pos_map.view(B, -1)
+      topi = flat.argmax(dim=1)
+      ys0 = (topi // W).float(); xs0 = (topi % W).float()
+      gmax = torch.stack([xs0, ys0], dim=-1)  # [B,2]
+      for b in range(B):
+        if pos_list[b].size(0) == 0:
+            pos_list[b] = gmax[b:b+1]
+              
+      # --- 局部 refine（各自用本類 heat；soft-argmax with τ） ---
+      def _refine_local(heat_b: torch.Tensor, xy_g_b: torch.Tensor):
+          if xy_g_b.numel() == 0: return xy_g_b
+          k = xy_g_b.size(0)
+          cx = xy_g_b[:, 0].round().clamp_(0, W-1).long()
+          cy = xy_g_b[:, 1].round().clamp_(0, H-1).long()
+          out = []
+          for i in range(k):
+              x0 = max(0, cx[i].item()-r); x1 = min(W, cx[i].item()+r+1)
+              y0 = max(0, cy[i].item()-r); y1 = min(H, cy[i].item()+r+1)
+              patch = heat_b[:, :, y0:y1, x0:x1]
+              hh, ww = patch.shape[-2:]
+              logits = torch.log(patch.clamp_min(1e-8)).view(1, -1)
+              sm = F.softmax(logits / max(1e-6, tau), dim=1).view(1,1,hh,ww)
+              xs = torch.linspace(0, ww-1, ww, device=heat_b.device).view(1,1,1,ww)
+              ys = torch.linspace(0, hh-1, hh, device=heat_b.device).view(1,1,hh,1)
+              dx = (sm*xs).sum(dim=(2,3)); dy = (sm*ys).sum(dim=(2,3))
+              gx = x0 + dx.squeeze(); gy = y0 + dy.squeeze()
+              out.append(torch.stack([gx, gy], dim=-1))
+          return torch.stack(out, dim=0)  # [k,2]
+
+      pos_refined, neg_refined = [], []
+      for b in range(B):
+          pos_refined.append(_refine_local(pos_map[b:b+1], pos_list[b]))
+          neg_refined.append(_refine_local(neg_map[b:b+1], neg_list[b]))
+
+      # --- grid→像素（對 cache_long） ---
+      sx = float(cache_long) / W; sy = float(cache_long) / H
+      def _grid2px(xy):
+          if xy.numel() == 0: return xy
+          return torch.stack([(xy[...,0]+0.5)*sx, (xy[...,1]+0.5)*sy], dim=-1)
+
+      pts_px_list, lbl_list = [], []
+      for b in range(B):
+          p_px = _grid2px(pos_refined[b]).to(grid_logits.dtype)
+          n_px = _grid2px(neg_refined[b]).to(grid_logits.dtype)
+          # 合併（先正後負；不硬湊到 kp/kn）
+          if p_px.numel() == 0 and n_px.numel() == 0:
+              # 正常不會發生（上面已保底），保險再給一個 (0,0) 的正點
+              pts_px = grid_logits.new_zeros((1,2))
+              lbl    = grid_logits.new_zeros((1,), dtype=torch.long) + 1
+          else:
+              pts_px = torch.cat([p_px, n_px], dim=0)
+              lbl    = torch.cat([
+                          torch.ones(p_px.size(0), dtype=torch.long, device=grid_logits.device),
+                          torch.zeros(n_px.size(0), dtype=torch.long, device=grid_logits.device)
+                      ], dim=0)
+          # 保證每張圖至少 1 點
+          if lbl.numel() == 0:
+              pts_px = grid_logits.new_zeros((1,2))
+              lbl    = grid_logits.new_zeros((1,), dtype=torch.long) + 1
+          pts_px_list.append(pts_px)
+          lbl_list.append(lbl)
+
+      return pts_px_list, lbl_list
+      
     def focal_loss_multiclass_ignore_neutral(
         self,
         logits: torch.Tensor,         # [B, 3, H, W]，你的 grid_logits
@@ -828,14 +808,19 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
         B = grid_logits.size(0)
         if (tgt_gt_mask_512 is not None):
             # 取得點
-            pts, lbl = self.points_from_grid(grid_logits)  # [B,K,2], [B,K]
+            pts_list, lbl_list = self.points_from_grid(grid_logits)
             
             if self.sam2_pred is not None:
                 # sam2_image_predictor 已經在外部 set_image_batch_from_cache(...) 好這一個 batch
                 # 準備 list[tensor]，每張一個 (保持 torch，不 numpy)
-                point_coords_batch = [pts[b] for b in range(B)]
-                point_labels_batch = [lbl[b] for b in range(B)]
-        
+                point_coords_batch = [p.to(dtype=torch.float32) for p in pts_list]
+                point_labels_batch = [l.to(dtype=torch.long)    for l in lbl_list]
+
+                global ggt
+                if ggt==0:
+                    print(point_coords_batch[0], point_labels_batch[0])
+                    ggt=1
+
                 masks_list, _, lowres_list = self.sam2_pred.predict_batch_logits_torch(
                     point_coords_batch=point_coords_batch,
                     point_labels_batch=point_labels_batch,
@@ -843,7 +828,7 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                     mask_input_batch=None,
                     multimask_output=False,
                     return_logits=True,
-                    normalize_coords=False,
+                    normalize_coords=True,
                 )
                 # lowres_list: List[Tensor [1,1,h,w] 或 [1,h,w]]
                 # 統一成 [B,1,h,w]
@@ -853,16 +838,6 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
                         t = t.unsqueeze(0)
                     lowres.append(t)
                 pred_mask_logits = torch.cat(lowres, dim=0)  # [B,1,h,w]
-                dice = dice_loss_from_logits(pred_mask_logits, tgt_gt_mask_512)
-        
-            elif self.sam2_torch is not None and (image_embeddings_for_sam2 is not None):
-                # 備援：可微 wrapper（逐張或整批）—如果你想保留
-                pred_mask_logits = self.sam2_torch.forward_with_embeddings(
-                    image_embeddings=image_embeddings_for_sam2,
-                    point_coords=pts,
-                    point_labels=lbl,
-                    orig_hw=(512, 512)
-                )
                 dice = dice_loss_from_logits(pred_mask_logits, tgt_gt_mask_512)
         
         if pred_mask_logits is not None:
@@ -880,6 +855,6 @@ class SupSegGridSAM2Spatial(SupSegGridSAM2):
             out["loss_aux_dice"] = aux_dice
         
         # === Total ===
-        total = self.lambda_ce * ce + self.lambda_dice * dice + self.aux_mask_weight * out["loss_aux_dice"]
+        total = self.lambda_ce * ce + self.lambda_dice * dice + self.lambda_aux * out["loss_aux_dice"]
         out["loss"] = total
         return out

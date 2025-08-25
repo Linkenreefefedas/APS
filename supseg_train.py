@@ -41,6 +41,7 @@ def collate_sup(batch):
     out['tgt_path'] = [b['tgt_path'] for b in batch]
     return out
 
+t=0
 def infer_sam2_masks_cached(points_xy, labels, tgt_rgb_list, tgt_mask_list, tgt_path_list, predictor, cache_dir, cache_long=1024):
     """Use your cached predictor path for non-differentiable mask decoding (fast). Returns list of masks and numpy IoUs."""
     ious = []
@@ -61,7 +62,11 @@ def infer_sam2_masks_cached(points_xy, labels, tgt_rgb_list, tgt_mask_list, tgt_
         data = torch.load(pt_path, map_location="cpu")
         predictor.set_image_from_cache(data["sam2"])  # no encoder
         _patch_predictor_transforms(predictor)
-        masks, scores, _ = predictor.predict(point_coords=xy, point_labels=lbl.astype(np.int32), multimask_output=True, normalize_coords=False)
+        global t
+        if t==0:
+            print(xy, lbl)
+            t=1
+        masks, scores, _ = predictor.predict(point_coords=xy, point_labels=lbl.astype(np.int32), multimask_output=True, normalize_coords=True)
         j = int(np.argmax(scores)); m = masks[j].astype(np.uint8)
         gt_lb = resize_mask(tgt_mask_list[b], cache_long)
         gt = (gt_lb>127).astype(np.uint8)
@@ -216,12 +221,12 @@ def main():
         
         # 輕量 head/主 Dice 的暖啟排程
         # 前 3 個 epoch 降低 Dice / aux 的權重，減少和 CE 的衝突
-        if epoch < start_epoch + 3:
+        if epoch < start_epoch + 10:
             model.lambda_dice = getattr(args, "lambda_dice_warm", 0.2)
-            model.aux_mask_weight = getattr(args, "aux_mask_weight_warm", 0.2)
+            model.lambda_aux = getattr(args, "aux_mask_weight_warm", 0.2)
         else:
             model.lambda_dice = args.lambda_dice
-            model.aux_mask_weight = args.aux_mask_weight
+            model.lambda_aux = args.lambda_aux
         
 
         for batch in tqdm(dl_tr, desc=f'Epoch {epoch}', unit='batch'):
@@ -292,6 +297,8 @@ def main():
 
         # ---------- simple validation (IoU via cached predictor) ----------
         if dl_val is not None and ((epoch+1) % args.eval_every == 0):
+            global t
+            t=0
             model.eval()
             ious = []
             with torch.no_grad():
@@ -310,10 +317,14 @@ def main():
                                 extra_maps32=None,#F.interpolate(extra, size=(32,32), mode='bilinear', align_corners=False),
                                 image_embeddings_for_sam2=None)
                     # get points and decode with fast predictor
-                    pts, lbl = model.points_from_grid(out['grid_logits'])
-                    pts_np = pts.detach().cpu().numpy()
-                    lbl_np = lbl.detach().cpu().numpy()
-                    iou_b, _ = infer_sam2_masks_cached(pts_np, lbl_np, batch['tgt_rgb'], batch['tgt_mask'], batch['tgt_path'], predictor, args.cache_dir, args.cache_long)
+                    pts_list, lbl_list = model.points_from_grid(out['grid_logits'])
+                    pts_np_list = [p.detach().cpu().numpy().astype(np.float32) for p in pts_list]
+                    lbl_np_list = [l.detach().cpu().numpy().astype(np.int32)  for l in lbl_list]
+
+                    iou_b, _ = infer_sam2_masks_cached(pts_np_list, lbl_np_list,
+                                                       batch['tgt_rgb'], batch['tgt_mask'],
+                                                       batch['tgt_path'], predictor,
+                                                       args.cache_dir, args.cache_long)
                     ious.extend(iou_b)
             
             print(f"\n[Val] mIoU={float(np.mean(ious)):.4f} over {len(ious)} images\n")
